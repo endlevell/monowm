@@ -1,112 +1,172 @@
 # mono
 
-A tiling Wayland compositor built on wlroots, with a per-tag toggleable infinite canvas.
+**Tiled by default, infinite by choice.**
 
-Most tiling WMs give you one thing: a fixed grid you resize windows inside of.
-mono still does that — dwindle tiling, gaps, floating windows, the usual — but
-any tag can independently switch into **canvas mode**: windows go free-floating
-on an unbounded 2D plane, and you pan/zoom around it with the mouse instead of
-being confined to your monitor's pixel count. Tag 1 can stay a normal tiled
-workspace while tag 2 is a literal open-ended surface for spatial hoarding —
-reference images, scratch terminals, whatever doesn't want to live inside a
-fixed grid.
+A lightweight Wayland compositor with dwindle tiling and infinite canvas
+workspaces.
+
+mono gives each tag two ways to work. Keep normal dwindle tiling when you want
+automatic structure, or switch that tag into canvas mode when you want windows
+on an open, pannable, zoomable surface. Canvas state is independent per tag, so
+tiled and spatial workspaces can coexist on the same monitor.
 
 ## Features
 
-- **Dwindle tiling** with cursor-aware splits — new windows open on whichever
-  side of the split your cursor is actually positioned over, not a fixed
-  default direction
-- **Canvas mode, per tag** — toggle any tag into a mouse-pannable, zoomable
-  infinite plane; other tags keep tiling normally
-- **Lua configuration** with live hot-reload (edit `config.lua`, save, done —
-  no restart)
-- **IPC via `monomsg`** — a standalone client for scripting/status-bar
-  integration, decoupled from the compositor itself
-- Double borders (inner/outer, independently colored) per client state
-  (normal / focused / urgent)
-- Tag-shift and view-shift bindings for relative tag navigation, not just
-  absolute jumps
+- Cursor-aware dwindle tiling and directional focus
+- Drag-to-rearrange tiles with edge placement preview
+- Per-tag infinite canvas mode with pan and zoom
+- Floating, fullscreen, gaps, smart gaps, and double borders
+- Lua 5.4 configuration with callback-driven key bindings
+- Live config reload with previous config retained after Lua errors
+- Window rules, monitor rules, input settings, and ordered autostart
+- `monomsg` IPC client for scripts and status bars
+- `ext-workspace-v1` integration
+- Layer shell, session lock, idle inhibition, screencopy, and output management
 - XWayland support
 
-## Dependencies
+## Quick Start
 
-- `libinput`
-- `wayland`
-- `wlroots-0.20` (built with the libinput backend)
-- `xkbcommon`
-- `lua5.4`
-- `wayland-protocols` (build-time only)
-- `pkg-config` (build-time only)
+Required libraries include wlroots 0.20, Wayland, libinput, xkbcommon, Lua 5.4,
+and XCB when XWayland is enabled. Full package details live in
+[Getting Started](docs/getting-started.md).
 
-Install these (plus `-devel`/`-dev` packages where your distro splits them),
-then:
+### Nix
+
+```sh
+nix develop
+make
+```
+
+### Other Systems
+
+Install development dependencies, then run:
 
 ```sh
 make
-sudo make install   # optional, installs to /usr/local/bin by default
+sudo make install
 ```
 
-## Configuration
+Build output:
 
-Copy the example config before your first run — mono won't start without one:
+```text
+build/mono
+tools/monomsg/build/monomsg
+```
+
+Install starter configuration:
 
 ```sh
 mkdir -p ~/.config/mono
 cp examples/config.lua ~/.config/mono/config.lua
 ```
 
-Edit `~/.config/mono/config.lua` to taste. See the file itself for the full
-option reference — appearance, input, monitor rules, autostart, keybinds, and
-mouse buttons are all configured there.
+Review program names in config, then start mono from TTY or display manager:
 
-### Canvas mode
-
-Toggle canvas mode on the active tag, pan with a mouse drag, zoom with
-`logo+scroll`. Bind it however you like in `config.lua`:
-
-```lua
-{ mods = { "logo" }, key = "c", action = "togglecanvas" },
+```sh
+mono
 ```
 
+Use local build without installing:
+
+```sh
+./build/mono -c ./examples/config.lua
+```
+
+## Lua Configuration
+
+Key bindings use callbacks:
+
 ```lua
+mono.bind("logo+return", function()
+	mono.action("spawn", "foot")
+end)
+```
+
+Configuration supports normal Lua code, loops, helper functions, and modules.
+Saving valid config replaces runtime callbacks and settings. Input devices,
+monitor setup, existing decorations, and autostart still require restart after
+relevant changes.
+
+See [Configuration](docs/configuration.md) and the commented
+[`examples/config.lua`](examples/config.lua).
+
+## Canvas Mode
+
+Toggle current tag between dwindle and canvas:
+
+```lua
+mono.bind("logo+c", function()
+	mono.action("togglecanvas")
+end)
+
 buttons = {
 	{ mods = {}, button = "middle", action = "canvaspan" },
 }
 ```
 
-Windows on a canvas-mode tag are always floating and have no position
-boundary — they exist wherever you last placed them in world space, and
-panning just changes which slice of that space your monitor is currently
-looking at.
+While canvas is active:
 
-## Project layout
+- middle-drag pans viewport
+- `logo+scroll` zooms
+- windows can move beyond monitor boundaries
+- disabling canvas returns affected windows to dwindle layout
+
+Current zoom resizes client buffers rather than scaling rendered textures. See
+[Canvas Mode](docs/canvas.md) for behavior and limitations.
+
+## Documentation
+
+- [Getting Started](docs/getting-started.md): dependencies, build, install,
+  first launch
+- [Configuration](docs/configuration.md): Lua options, callbacks, modules, hot
+  reload
+- [Actions](docs/actions.md): supported `mono.action()` names and arguments
+- [Canvas Mode](docs/canvas.md): controls, coordinate model, limitations
+- [monomsg IPC](docs/monomsg.md): query, watch, and change compositor state
+- [Troubleshooting](docs/troubleshooting.md): config, build, runtime, XWayland,
+  IPC, canvas, and memory issues
+
+## Command Line
+
+```text
+mono [-v] [-d] [-s startup-command] [-c config-file]
 ```
-config/ - compile-time defaults (config.h)
-examples/ - example user config.lua
-include/mono/ - public headers
-protocols/ - wayland protocol XML + generated bindings
-src/ compositor - source
-tools/monomsg/ - standalone IPC client
+
+- `-c path`: use custom config
+- `-d`: enable debug logging
+- `-s command`: run shell command after Wayland starts
+- `-v`: print version
+
+## Project Layout
+
+```text
+config/             compiled layout defaults
+docs/               user documentation
+examples/           starter Lua configuration
+include/mono/       compositor headers and protocol integration
+protocols/          Wayland protocol XML and generated bindings
+src/                compositor source
+tools/monomsg/      IPC command-line client
+build/              compositor build output
 ```
 
 ## Roadmap
 
-- [ ] True optical zoom (scale rendered buffers instead of resizing clients)
-- [ ] Separate trackpad scroll from mouse wheel scroll
-- [ ] Configurable keymap
-- [ ] Custom config path via CLI flag, with `/etc/mono/config.lua` fallback
+- [ ] True optical canvas zoom
+- [ ] Separate trackpad scrolling from mouse-wheel canvas zoom
+- [ ] Configurable keyboard layout/keymap
+- [ ] System config fallback at `/etc/mono/config.lua`
 
 ## Credits
 
-mono began as a fork of a dwl-based project which itself draws from
-[dwl](https://codeberg.org/dwl/dwl), [dwm](https://dwm.suckless.org/), and
-borrows its ext-workspace protocol implementation from
-[MangoWM](https://github.com/mangowm/mango) — see `licenses/` for the full
-attribution chain. The canvas concept draws inspiration from
-[vxwm](https://codeberg.org/wh1tepearl/vxwm), and also Tsukasa's
-[swindle](https://gitea.hgdump.net/tsukasa/swindle) for the lua parser and, further upstream,
-[hevel](https://github.com/AlbertoBSD/hevel).
+mono began from dwl-derived work and draws from
+[dwl](https://codeberg.org/dwl/dwl), [dwm](https://dwm.suckless.org/),
+[MangoWM](https://github.com/mangowm/mango),
+[vxwm](https://codeberg.org/wh1tepearl/vxwm),
+[swindle](https://gitea.hgdump.net/tsukasa/swindle), and
+[hevel](https://github.com/AlbertoBSD/hevel). Preserve applicable upstream
+attribution and license notices when redistributing.
 
 ## License
 
-MIT
+MIT. See [`LICENSE`](LICENSE).

@@ -1,5 +1,5 @@
 {
-  description = "mono: a dwl fork with Lua config, IPC, and ext-workspace support, plus its smsg client";
+  description = "mono: tiled by default, infinite by choice";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -25,14 +25,14 @@
           ];
 
           buildInputs = with pkgs; [
-            wayland           
-            wlroots_0_20          
-            pixman          
+            wayland
+            wlroots_0_20
+            pixman
             libxkbcommon
             libinput
             lua5_4
-            libxcb         
-            libxcb-wm     
+            libxcb
+            libxcb-wm
           ];
 
           enableParallelBuilding = true;
@@ -45,8 +45,8 @@
           makeFlags = [ "PREFIX=${placeholder "out"}" ];
 
           meta = with pkgs.lib; {
-            description = "A dwl fork with Lua configuration, IPC support, and ext-workspace-v1";
-            license = with licenses; [ gpl3Only mit isc ]; 
+            description = "A lightweight Wayland compositor with dwindle tiling and infinite canvas workspaces";
+            license = with licenses; [ gpl3Only mit isc ];
             platforms = platforms.linux;
             mainProgram = "mono";
           };
@@ -62,4 +62,3 @@
         };
       });
 }
-
