@@ -577,24 +577,27 @@ register_mono_api(lua_State *L)
 int
 config_load(const char *path, Config *cfg)
 {
+	lua_State *old_L = g_L;
+	lua_State *L;
+
 	memset(cfg, 0, sizeof(*cfg));
 
-	if (!g_L) {
-		g_L = luaL_newstate();
-		if (!g_L) {
-			fprintf(stderr, "mono config: failed to create Lua state. "
-			        "Truly rock bottom.\n");
-			return -1;
-		}
-		luaL_openlibs(g_L);
-		register_mono_api(g_L);
+	L = luaL_newstate();
+	if (!L) {
+		fprintf(stderr, "mono config: failed to create Lua state. "
+		        "Truly rock bottom.\n");
+		return -1;
 	}
-	lua_State *L = g_L;
+	luaL_openlibs(L);
+	register_mono_api(L);
+	g_L = L;
 
 	g_loading_cfg = cfg;
 	if (luaL_dofile(L, path) != LUA_OK) {
 		lua_log_error(L, "load");
 		g_loading_cfg = NULL;
+		lua_close(L);
+		g_L = old_L;
 		return -1;
 	}
 	g_loading_cfg = NULL;
@@ -624,8 +627,8 @@ config_load(const char *path, Config *cfg)
 	parse_keybinds  (L, cfg);
 	parse_buttons   (L, cfg);
 	parse_autostart (L, cfg);
-	/* g_L stays open — persists across hot-reloads so registered
-	 * Lua callbacks (mono.bind) remain valid function references */
+	if (old_L)
+		lua_close(old_L);
 	return 0;
 }
 

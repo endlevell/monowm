@@ -2139,8 +2139,10 @@ mapnotify(struct wl_listener *listener, void *data)
 	}
 
 	if (c->mon == selmon && (c->mon->canvas_tags & c->mon->tagset[c->mon->seltags])) {
-		c->world_x = c->mon->canvas_x + cursor->x / c->mon->zoom;
-		c->world_y = c->mon->canvas_y + cursor->y / c->mon->zoom;
+		c->world_x = c->mon->m.x + c->mon->canvas_x
+				+ (cursor->x - c->mon->m.x) / c->mon->zoom;
+		c->world_y = c->mon->m.y + c->mon->canvas_y
+				+ (cursor->y - c->mon->m.y) / c->mon->zoom;
 		c->world_width = c->geom.width;
 		c->world_height = c->geom.height;
 		c->world_set = 1;
@@ -2258,8 +2260,10 @@ motionnotify(uint32_t time, struct wlr_input_device *device, double dx, double d
 		resize(grabc, (struct wlr_box){.x = (int)round(cursor->x) - grabcx, .y = (int)round(cursor->y) - grabcy,
 			.width = grabc->geom.width, .height = grabc->geom.height}, 1);
 		if (grabc->mon && (grabc->mon->canvas_tags & grabc->mon->tagset[grabc->mon->seltags])) {
-			grabc->world_x = grabc->geom.x / grabc->mon->zoom + grabc->mon->canvas_x;
-			grabc->world_y = grabc->geom.y / grabc->mon->zoom + grabc->mon->canvas_y;
+			grabc->world_x = grabc->mon->m.x + grabc->mon->canvas_x
+					+ (grabc->geom.x - grabc->mon->m.x) / grabc->mon->zoom;
+			grabc->world_y = grabc->mon->m.y + grabc->mon->canvas_y
+					+ (grabc->geom.y - grabc->mon->m.y) / grabc->mon->zoom;
 		}
 		return;
 	} else if (cursor_mode == CurResize) {
@@ -3491,18 +3495,20 @@ canvas_layout(Monitor *m)
 		if (c->mon != m || !VISIBLEON(c, m) || c->isfullscreen)
 			continue;
 		if (!c->world_set) {
-			c->world_x = c->geom.x + m->canvas_x;
-			c->world_y = c->geom.y + m->canvas_y;
-			c->world_width = c->geom.width;
-			c->world_height = c->geom.height;
+			c->world_x = m->m.x + m->canvas_x
+					+ (c->geom.x - m->m.x) / m->zoom;
+			c->world_y = m->m.y + m->canvas_y
+					+ (c->geom.y - m->m.y) / m->zoom;
+			c->world_width = c->geom.width / m->zoom;
+			c->world_height = c->geom.height / m->zoom;
 			c->world_set = 1;
 		}
 		if (!c->isfloating) {
 			c->isfloating = 1;
 			wlr_scene_node_reparent(&c->scene->node, layers[LyrFloat]);
 		}
-		int rx = (int)round((c->world_x - m->canvas_x) * m->zoom);
-		int ry = (int)round((c->world_y - m->canvas_y) * m->zoom);
+		int rx = m->m.x + (int)round((c->world_x - m->m.x - m->canvas_x) * m->zoom);
+		int ry = m->m.y + (int)round((c->world_y - m->m.y - m->canvas_y) * m->zoom);
 		resize(c, (struct wlr_box){
 			.x = rx,
 			.y = ry,
@@ -3991,9 +3997,25 @@ movecenter(const Arg *arg)
 void
 togglecanvas(const Arg *arg)
 {
+	Client *c;
+	uint32_t tags, disabled;
+
 	if (!selmon)
 		return;
-	selmon->canvas_tags ^= selmon->tagset[selmon->seltags];
+	tags = selmon->tagset[selmon->seltags];
+	disabled = selmon->canvas_tags & tags;
+	selmon->canvas_tags ^= tags;
+
+	/* Leaving canvas returns its windows to the dwindle layout. */
+	if (disabled) {
+		wl_list_for_each(c, &clients, link) {
+			if (c->mon == selmon && (c->tags & disabled)
+					&& !(c->tags & selmon->canvas_tags)) {
+				c->isfloating = 0;
+				wlr_scene_node_reparent(&c->scene->node, layers[LyrTile]);
+			}
+		}
+	}
 	arrange(selmon);
 }
 
@@ -4265,4 +4287,3 @@ main(int argc, char *argv[])
 usage:
 	die("Usage: %s [-v] [-d] [-s startup command] [-c config file]", argv[0]);
 }
-
