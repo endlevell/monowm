@@ -1,5 +1,5 @@
-#ifndef SWINDLE_PARSER_H
-#define SWINDLE_PARSER_H
+#ifndef MONO_PARSER_H
+#define MONO_PARSER_H
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -157,4 +157,3 @@ struct wl_event_source *config_watch_start(
 void config_watch_stop(struct wl_event_source *src);
 
 #endif
-
