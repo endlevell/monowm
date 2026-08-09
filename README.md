@@ -103,7 +103,7 @@ mono began as a fork of a dwl-based project which itself draws from
 borrows its ext-workspace protocol implementation from
 [MangoWM](https://github.com/mangowm/mango) — see `licenses/` for the full
 attribution chain. The canvas concept draws inspiration from
-[vxwm](https://codeberg.org/wh1tepearl/vxwm)
+[vxwm](https://codeberg.org/wh1tepearl/vxwm), and also Tsukasa's
 [swindle](https://gitea.hgdump.net/tsukasa/swindle) for the lua parser and, further upstream,
 [hevel](https://github.com/AlbertoBSD/hevel).
 
