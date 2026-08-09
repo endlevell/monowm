@@ -1,0 +1,11 @@
+
+
+# Binaries
+mono
+monomsg
+
+# Objects
+*.o
+
+# Generated runtime files
+*.log
