@@ -1,11 +1,15 @@
 
 
-# Binaries
-mono
-monomsg
-
-# Objects
+# Build output
+/build/
+/tools/monomsg/build/
 *.o
+/mono
+/tools/monomsg/monomsg
+/protocols/generated/*-protocol.c
+/protocols/generated/*-protocol.h
+/tools/monomsg/include/*-protocol.c
+/tools/monomsg/include/*-protocol.h
 
 # Generated runtime files
 *.log
