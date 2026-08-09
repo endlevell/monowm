@@ -102,6 +102,20 @@ typedef struct {
 } Button;
 
 typedef struct Monitor Monitor;
+typedef struct CanvasNodeState CanvasNodeState;
+struct CanvasNodeState {
+	struct wl_list link;
+	void *client;
+	struct wlr_scene_node *node;
+	struct wl_listener destroy;
+	struct wl_listener surface_commit;
+	int x, y, width, height;
+	int dst_width, dst_height;
+	enum wlr_scale_filter_mode filter_mode;
+	wlr_scene_buffer_point_accepts_input_func_t accepts_input;
+	unsigned int generation;
+};
+
 typedef struct {
 	/* Must keep this field first */
 	unsigned int type; /* XDGShell or X11* */
@@ -110,6 +124,10 @@ typedef struct {
   double world_x, world_y;
   double world_width, world_height;
   int world_set;
+	double visual_scale;
+	unsigned int canvas_generation;
+	struct wl_list canvas_nodes;
+	struct wl_event_source *canvas_refresh;
 	struct wlr_scene_tree *scene;
 	struct wlr_scene_rect *inner_border[4]; /* inner top, bottom, left, right */
 	struct wlr_scene_rect *outer_border[4]; /* outer top, bottom, left, right */
@@ -125,6 +143,7 @@ typedef struct {
 	} surface;
 	struct wlr_xdg_toplevel_decoration_v1 *decoration;
 	struct wl_listener commit;
+	struct wl_listener new_subsurface;
 	struct wl_listener map;
 	struct wl_listener maximize;
 	struct wl_listener unmap;
@@ -290,6 +309,17 @@ typedef struct {
 static void applybounds(Client *c, struct wlr_box *bbox);
 static void applyrules(Client *c);
 static void arrange(Monitor *m);
+static void canvas_apply(Client *c, double scale);
+static int canvas_active(Client *c);
+static void canvas_clear(Client *c);
+static void canvas_node_destroy(struct wl_listener *listener, void *data);
+static void canvas_new_subsurface(struct wl_listener *listener, void *data);
+static void canvas_surface_commit(struct wl_listener *listener, void *data);
+static void canvas_refresh_idle(void *data);
+static void canvas_restore(Client *c);
+static bool canvas_buffer_accepts_input(struct wlr_scene_buffer *buffer,
+		double *sx, double *sy);
+static void canvas_cancel_grab(Client *c);
 static void arrangelayer(Monitor *m, struct wl_list *list,
 		struct wlr_box *usable_area, int exclusive);
 static void arrangelayers(Monitor *m);
@@ -604,7 +634,16 @@ arrange(Monitor *m)
       client_set_suspended(c, !(VISIBLEON(c, m)));
 		}
 	}
-  if (m->canvas_tags & m->tagset[m->seltags]) {
+	wl_list_for_each(c, &clients, link) {
+		if (c->mon == m && VISIBLEON(c, m) && !canvas_active(c)
+				&& !wl_list_empty(&c->canvas_nodes)) {
+			canvas_restore(c);
+			c->world_set = 0;
+			c->isfloating = 0;
+			wlr_scene_node_reparent(&c->scene->node, layers[LyrTile]);
+		}
+	}
+	if (m->canvas_tags & m->tagset[m->seltags]) {
 		canvas_layout(m);
 	}
 	wlr_scene_node_set_enabled(&m->fullscreen_bg->node,
@@ -705,9 +744,17 @@ axisnotify(struct wl_listener *listener, void *data)
 
 	if (CLEANMASK(mods) == WLR_MODIFIER_LOGO && selmon
 			&& (selmon->canvas_tags & selmon->tagset[selmon->seltags])) {
-		selmon->zoom += (event->delta < 0 ? 0.1 : -0.1);
-		if (selmon->zoom < 0.2) selmon->zoom = 0.2;
-		if (selmon->zoom > 3.0) selmon->zoom = 3.0;
+		double old_zoom = selmon->zoom;
+		double world_x = selmon->canvas_x
+				+ (cursor->x - selmon->m.x) / old_zoom;
+		double world_y = selmon->canvas_y
+				+ (cursor->y - selmon->m.y) / old_zoom;
+		selmon->zoom = MIN(3.0, MAX(0.2,
+				old_zoom + (event->delta < 0 ? 0.1 : -0.1)));
+		selmon->canvas_x = world_x
+				- (cursor->x - selmon->m.x) / selmon->zoom;
+		selmon->canvas_y = world_y
+				- (cursor->y - selmon->m.y) / selmon->zoom;
 		canvas_layout(selmon);
 		return;
 	}
@@ -1011,7 +1058,9 @@ commitnotify(struct wl_listener *listener, void *data)
 		return;
 	}
 
-	resize(c, c->geom, (c->isfloating && !c->isfullscreen));
+	if (!canvas_active(c)) {
+		resize(c, c->geom, (c->isfloating && !c->isfullscreen));
+	}
 
 	/* mark a pending resize as completed */
 	if (c->resize && c->resize <= c->surface.xdg->current.configure_serial)
@@ -1044,6 +1093,10 @@ commitpopup(struct wl_listener *listener, void *data)
 	box.x -= (type == LayerShell ? l->scene->node.x : c->geom.x);
 	box.y -= (type == LayerShell ? l->scene->node.y : c->geom.y);
 	wlr_xdg_popup_unconstrain_from_box(popup, &box);
+	if (c && canvas_active(c)) {
+		canvas_restore(c);
+		canvas_layout(c->mon);
+	}
 	wl_list_remove(&listener->link);
 	free(listener);
 }
@@ -2086,6 +2139,10 @@ mapnotify(struct wl_listener *listener, void *data)
 
 	/* Create scene tree for this client and its border */
 	c->scene = client_surface(c)->data = wlr_scene_tree_create(layers[LyrTile]);
+	wl_list_init(&c->canvas_nodes);
+	c->visual_scale = 1.0;
+	LISTEN(&client_surface(c)->events.new_subsurface, &c->new_subsurface,
+			canvas_new_subsurface);
 	/* Enabled later by a call to arrange() */
 	wlr_scene_node_set_enabled(&c->scene->node, client_is_unmanaged(c));
 	c->scene_surface = c->type == XDGShell
@@ -2215,8 +2272,13 @@ motionnotify(uint32_t time, struct wlr_input_device *device, double dx, double d
 			&& toplevel_from_wlr_surface(seat->pointer_state.focused_surface, &w, &l) >= 0) {
 		c = w;
 		surface = seat->pointer_state.focused_surface;
-		sx = cursor->x - (l ? l->scene->node.x : w->geom.x);
-		sy = cursor->y - (l ? l->scene->node.y : w->geom.y);
+		if (w && canvas_active(w)) {
+			sx = (cursor->x - w->scene->node.x) / w->mon->zoom - w->bw;
+			sy = (cursor->y - w->scene->node.y) / w->mon->zoom - w->bw;
+		} else {
+			sx = cursor->x - (l ? l->scene->node.x : w->geom.x);
+			sy = cursor->y - (l ? l->scene->node.y : w->geom.y);
+		}
 	}
 
 	/* time is 0 in internal calls meant to restore pointer focus. */
@@ -2256,6 +2318,16 @@ motionnotify(uint32_t time, struct wlr_input_device *device, double dx, double d
 
 	/* If we are currently grabbing the mouse, handle and return */
 	if (cursor_mode == CurMove) {
+		if (canvas_active(grabc)) {
+			grabc->world_x = grabc->mon->m.x + grabc->mon->canvas_x
+					+ ((int)round(cursor->x) - grabcx - grabc->mon->m.x)
+					/ grabc->mon->zoom;
+			grabc->world_y = grabc->mon->m.y + grabc->mon->canvas_y
+					+ ((int)round(cursor->y) - grabcy - grabc->mon->m.y)
+					/ grabc->mon->zoom;
+			canvas_layout(grabc->mon);
+			return;
+		}
 		/* Move the grabbed client to the new position. */
 		resize(grabc, (struct wlr_box){.x = (int)round(cursor->x) - grabcx, .y = (int)round(cursor->y) - grabcy,
 			.width = grabc->geom.width, .height = grabc->geom.height}, 1);
@@ -2267,6 +2339,23 @@ motionnotify(uint32_t time, struct wlr_input_device *device, double dx, double d
 		}
 		return;
 	} else if (cursor_mode == CurResize) {
+		if (canvas_active(grabc)) {
+			canvas_restore(grabc);
+			grabc->world_width = MAX(1.0,
+					(cursor->x - grabc->mon->m.x) / grabc->mon->zoom
+					+ grabc->mon->m.x + grabc->mon->canvas_x - grabc->world_x);
+			grabc->world_height = MAX(1.0,
+					(cursor->y - grabc->mon->m.y) / grabc->mon->zoom
+					+ grabc->mon->m.y + grabc->mon->canvas_y - grabc->world_y);
+			resize(grabc, (struct wlr_box){
+				.x = (int)round(grabc->world_x),
+				.y = (int)round(grabc->world_y),
+				.width = (int)round(grabc->world_width),
+				.height = (int)round(grabc->world_height),
+			}, 1);
+			canvas_layout(grabc->mon);
+			return;
+		}
 		resize(grabc, (struct wlr_box){.x = grabc->geom.x, .y = grabc->geom.y,
 			.width = (int)round(cursor->x) - grabc->geom.x, .height = (int)round(cursor->y) - grabc->geom.y}, 1);
 		if (grabc->mon && (grabc->mon->canvas_tags & grabc->mon->tagset[grabc->mon->seltags])) {
@@ -2305,8 +2394,10 @@ motionnotify(uint32_t time, struct wlr_input_device *device, double dx, double d
 		}
 		return;
 	} else if (cursor_mode == CurCanvasPan) {
-		selmon->canvas_x = selmon->pan_start_ox - (cursor->x - selmon->pan_start_cx);
-		selmon->canvas_y = selmon->pan_start_oy - (cursor->y - selmon->pan_start_cy);
+		selmon->canvas_x = selmon->pan_start_ox
+				- (cursor->x - selmon->pan_start_cx) / selmon->zoom;
+		selmon->canvas_y = selmon->pan_start_oy
+				- (cursor->y - selmon->pan_start_cy) / selmon->zoom;
 		canvas_layout(selmon);
 		return;
 	}
@@ -2358,6 +2449,19 @@ moveresize(const Arg *arg)
 	xytonode(cursor->x, cursor->y, NULL, &grabc, NULL, NULL, NULL);
 	if (!grabc || client_is_unmanaged(grabc) || grabc->isfullscreen)
 		return;
+	if (canvas_active(grabc)) {
+		setfloating(grabc, 1);
+		cursor_mode = arg->ui;
+		grabcx = (int)round(cursor->x) - grabc->scene->node.x;
+		grabcy = (int)round(cursor->y) - grabc->scene->node.y;
+		wlr_cursor_set_xcursor(cursor, cursor_mgr,
+				arg->ui == CurMove ? "all-scroll" : "se-resize");
+		if (arg->ui == CurResize)
+			wlr_cursor_warp_closest(cursor, NULL,
+					grabc->scene->node.x + (int)round(grabc->world_width * grabc->mon->zoom),
+					grabc->scene->node.y + (int)round(grabc->world_height * grabc->mon->zoom));
+		return;
+	}
 
 	if (arg->ui == CurMove && !grabc->isfloating
 			&& grabc->mon->lt[grabc->mon->sellt]->arrange) {
@@ -2784,6 +2888,8 @@ setfloating(Client *c, int floating)
 void
 setfullscreen(Client *c, int fullscreen)
 {
+	if (c->scene && !wl_list_empty(&c->canvas_nodes))
+		canvas_restore(c);
 	c->isfullscreen = fullscreen;
 	if (!c->mon || !client_surface(c)->mapped)
 		return;
@@ -2833,6 +2939,10 @@ setmon(Client *c, Monitor *m, uint32_t newtags)
 
 	if (oldmon == m)
 		return;
+	canvas_cancel_grab(c);
+	if (c->scene && !wl_list_empty(&c->canvas_nodes))
+		canvas_restore(c);
+	c->world_set = 0;
 	c->mon = m;
 	c->prev = c->geom;
 
@@ -3179,6 +3289,10 @@ tag(const Arg *arg)
 		return;
 
 	/* Remove from the source tag's dwindle tree */
+	canvas_cancel_grab(sel);
+	if (sel->scene && !wl_list_empty(&sel->canvas_nodes))
+		canvas_restore(sel);
+	sel->world_set = 0;
 	dwindle_remove_client(sel);
 	sel->tags = arg->ui & TAGMASK;
 	focusclient(focustop(selmon), 1);
@@ -3485,6 +3599,232 @@ preselect_indicator_box(struct wlr_box target, DwindleEdge edge)
 	return r;
 }
 
+static int
+canvas_active(Client *c)
+{
+	return c->mon && (c->mon->canvas_tags & c->tags
+			& c->mon->tagset[c->mon->seltags]) && !c->isfullscreen;
+}
+
+static void
+canvas_cancel_grab(Client *c)
+{
+	if (grabc != c || (cursor_mode != CurMove && cursor_mode != CurResize))
+		return;
+	cursor_mode = CurNormal;
+	grabc = NULL;
+	wlr_cursor_set_xcursor(cursor, cursor_mgr, "default");
+}
+
+static bool
+canvas_buffer_accepts_input(struct wlr_scene_buffer *buffer, double *sx, double *sy)
+{
+	Client *c;
+	CanvasNodeState *state;
+	wl_list_for_each(c, &clients, link) {
+		wl_list_for_each(state, &c->canvas_nodes, link) {
+			if (state->node != &buffer->node)
+				continue;
+			*sx /= c->visual_scale;
+			*sy /= c->visual_scale;
+			return !state->accepts_input
+					|| state->accepts_input(buffer, sx, sy);
+		}
+	}
+	return true;
+}
+
+static CanvasNodeState *
+canvas_node_state(Client *c, struct wlr_scene_node *node)
+{
+	CanvasNodeState *state;
+	wl_list_for_each(state, &c->canvas_nodes, link)
+		if (state->node == node)
+			return state;
+	return NULL;
+}
+
+static void
+canvas_transform_tree(Client *c, struct wlr_scene_tree *tree, double scale)
+{
+	struct wlr_scene_node *node;
+	wl_list_for_each(node, &tree->children, link) {
+		CanvasNodeState *state = canvas_node_state(c, node);
+		if (!state) {
+			state = ecalloc(1, sizeof(*state));
+			state->client = c;
+			state->node = node;
+			wl_list_init(&state->surface_commit.link);
+			state->destroy.notify = canvas_node_destroy;
+			wl_signal_add(&node->events.destroy, &state->destroy);
+			state->x = node->x;
+			state->y = node->y;
+			if (node->type == WLR_SCENE_NODE_BUFFER) {
+				struct wlr_scene_buffer *buffer = wlr_scene_buffer_from_node(node);
+				struct wlr_scene_surface *surface = wlr_scene_surface_try_from_buffer(buffer);
+				state->dst_width = buffer->dst_width;
+				state->dst_height = buffer->dst_height;
+				state->filter_mode = buffer->filter_mode;
+				state->accepts_input = buffer->point_accepts_input;
+				if (surface) {
+					state->width = buffer->dst_width > 0
+							? buffer->dst_width : surface->surface->current.width;
+					state->height = buffer->dst_height > 0
+							? buffer->dst_height : surface->surface->current.height;
+					state->surface_commit.notify = canvas_surface_commit;
+					wl_signal_add(&surface->surface->events.commit,
+							&state->surface_commit);
+					wl_list_remove(&state->surface_commit.link);
+					wl_list_insert(&surface->surface->events.commit.listener_list,
+							&state->surface_commit.link);
+				} else if (buffer->buffer) {
+					state->width = buffer->buffer->width;
+					state->height = buffer->buffer->height;
+				}
+			} else if (node->type == WLR_SCENE_NODE_RECT) {
+				struct wlr_scene_rect *rect = wlr_scene_rect_from_node(node);
+				state->width = rect->width;
+				state->height = rect->height;
+			}
+			wl_list_insert(&c->canvas_nodes, &state->link);
+		}
+
+		state->generation = c->canvas_generation;
+		wlr_scene_node_set_position(node, (int)round(state->x * scale),
+				(int)round(state->y * scale));
+
+		if (node->type == WLR_SCENE_NODE_BUFFER && state->width > 0 && state->height > 0) {
+			struct wlr_scene_buffer *buffer = wlr_scene_buffer_from_node(node);
+			buffer->point_accepts_input = canvas_buffer_accepts_input;
+			wlr_scene_buffer_set_dest_size(buffer,
+					MAX(1, (int)round(state->width * scale)),
+					MAX(1, (int)round(state->height * scale)));
+			wlr_scene_buffer_set_filter_mode(buffer, WLR_SCALE_FILTER_BILINEAR);
+		} else if (node->type == WLR_SCENE_NODE_RECT) {
+			wlr_scene_rect_set_size(wlr_scene_rect_from_node(node),
+					MAX(0, (int)round(state->width * scale)),
+					MAX(0, (int)round(state->height * scale)));
+		} else if (node->type == WLR_SCENE_NODE_TREE) {
+			canvas_transform_tree(c, wlr_scene_tree_from_node(node), scale);
+		}
+	}
+}
+
+static void
+canvas_apply(Client *c, double scale)
+{
+	CanvasNodeState *state, *tmp;
+	c->canvas_generation++;
+	canvas_transform_tree(c, c->scene, scale);
+	wl_list_for_each_safe(state, tmp, &c->canvas_nodes, link) {
+		if (state->generation != c->canvas_generation) {
+			if (state->surface_commit.link.next)
+				wl_list_remove(&state->surface_commit.link);
+			wl_list_remove(&state->destroy.link);
+			wl_list_remove(&state->link);
+			free(state);
+		}
+	}
+	c->visual_scale = scale;
+}
+
+static void
+canvas_restore_tree(Client *c, struct wlr_scene_tree *tree)
+{
+	struct wlr_scene_node *node;
+	wl_list_for_each(node, &tree->children, link) {
+		CanvasNodeState *state = canvas_node_state(c, node);
+		if (state) {
+			wlr_scene_node_set_position(node, state->x, state->y);
+			if (node->type == WLR_SCENE_NODE_BUFFER) {
+				struct wlr_scene_buffer *buffer = wlr_scene_buffer_from_node(node);
+				wlr_scene_buffer_set_dest_size(buffer, state->dst_width, state->dst_height);
+				wlr_scene_buffer_set_filter_mode(buffer, state->filter_mode);
+				buffer->point_accepts_input = state->accepts_input;
+			} else if (node->type == WLR_SCENE_NODE_RECT) {
+				wlr_scene_rect_set_size(wlr_scene_rect_from_node(node),
+						state->width, state->height);
+			}
+		}
+		if (node->type == WLR_SCENE_NODE_TREE)
+			canvas_restore_tree(c, wlr_scene_tree_from_node(node));
+	}
+}
+
+static void
+canvas_restore(Client *c)
+{
+	CanvasNodeState *state, *tmp;
+	if (!c->scene || wl_list_empty(&c->canvas_nodes))
+		return;
+	canvas_restore_tree(c, c->scene);
+	wl_list_for_each_safe(state, tmp, &c->canvas_nodes, link) {
+		if (state->surface_commit.link.next)
+			wl_list_remove(&state->surface_commit.link);
+		wl_list_remove(&state->destroy.link);
+		wl_list_remove(&state->link);
+		free(state);
+	}
+	c->visual_scale = 1.0;
+}
+
+static void
+canvas_clear(Client *c)
+{
+	CanvasNodeState *state, *tmp;
+	if (c->canvas_refresh) {
+		wl_event_source_remove(c->canvas_refresh);
+		c->canvas_refresh = NULL;
+	}
+	wl_list_for_each_safe(state, tmp, &c->canvas_nodes, link) {
+		if (state->surface_commit.link.next)
+			wl_list_remove(&state->surface_commit.link);
+		wl_list_remove(&state->destroy.link);
+		wl_list_remove(&state->link);
+		free(state);
+	}
+}
+
+static void
+canvas_node_destroy(struct wl_listener *listener, void *data)
+{
+	CanvasNodeState *state = wl_container_of(listener, state, destroy);
+	if (state->surface_commit.link.next)
+		wl_list_remove(&state->surface_commit.link);
+	wl_list_remove(&state->destroy.link);
+	wl_list_remove(&state->link);
+	free(state);
+}
+
+static void
+canvas_new_subsurface(struct wl_listener *listener, void *data)
+{
+	Client *c = wl_container_of(listener, c, new_subsurface);
+	if (canvas_active(c) && !c->canvas_refresh)
+		c->canvas_refresh = wl_event_loop_add_idle(event_loop,
+				canvas_refresh_idle, c);
+}
+
+static void
+canvas_surface_commit(struct wl_listener *listener, void *data)
+{
+	CanvasNodeState *state = wl_container_of(listener, state, surface_commit);
+	Client *c = state->client;
+	canvas_restore(c);
+	if (!c->canvas_refresh)
+		c->canvas_refresh = wl_event_loop_add_idle(event_loop,
+				canvas_refresh_idle, c);
+}
+
+static void
+canvas_refresh_idle(void *data)
+{
+	Client *c = data;
+	c->canvas_refresh = NULL;
+	if (canvas_active(c))
+		canvas_layout(c->mon);
+}
+
 /* layout entry point */
 
 void
@@ -3492,29 +3832,29 @@ canvas_layout(Monitor *m)
 {
 	Client *c;
 	wl_list_for_each(c, &clients, link) {
-		if (c->mon != m || !VISIBLEON(c, m) || c->isfullscreen)
+		if (c->mon != m || !VISIBLEON(c, m) || !canvas_active(c))
 			continue;
 		if (!c->world_set) {
 			c->world_x = m->m.x + m->canvas_x
 					+ (c->geom.x - m->m.x) / m->zoom;
 			c->world_y = m->m.y + m->canvas_y
 					+ (c->geom.y - m->m.y) / m->zoom;
-			c->world_width = c->geom.width / m->zoom;
-			c->world_height = c->geom.height / m->zoom;
+			c->world_width = c->geom.width;
+			c->world_height = c->geom.height;
 			c->world_set = 1;
 		}
 		if (!c->isfloating) {
 			c->isfloating = 1;
 			wlr_scene_node_reparent(&c->scene->node, layers[LyrFloat]);
 		}
-		int rx = m->m.x + (int)round((c->world_x - m->m.x - m->canvas_x) * m->zoom);
-		int ry = m->m.y + (int)round((c->world_y - m->m.y - m->canvas_y) * m->zoom);
-		resize(c, (struct wlr_box){
-			.x = rx,
-			.y = ry,
-			.width = (int)round(c->world_width * m->zoom),
-			.height = (int)round(c->world_height * m->zoom),
-		}, 0);
+		c->geom.x = (int)round(c->world_x);
+		c->geom.y = (int)round(c->world_y);
+		c->geom.width = MAX(1, (int)round(c->world_width));
+		c->geom.height = MAX(1, (int)round(c->world_height));
+		wlr_scene_node_set_position(&c->scene->node,
+				m->m.x + (int)round((c->world_x - m->m.x - m->canvas_x) * m->zoom),
+				m->m.y + (int)round((c->world_y - m->m.y - m->canvas_y) * m->zoom));
+		canvas_apply(c, m->zoom);
 	}
 }
 
@@ -3755,6 +4095,10 @@ toggletag(const Arg *arg)
 	if (!sel || !(newtags = sel->tags ^ (arg->ui & TAGMASK)))
 		return;
 
+	canvas_cancel_grab(sel);
+	if (sel->scene && !wl_list_empty(&sel->canvas_nodes))
+		canvas_restore(sel);
+	sel->world_set = 0;
 	dwindle_remove_client(sel);
 	sel->tags = newtags;
 	focusclient(focustop(selmon), 1);
@@ -3820,6 +4164,8 @@ unmapnotify(struct wl_listener *listener, void *data)
 		wl_list_remove(&c->flink);
 	}
 
+	wl_list_remove(&c->new_subsurface.link);
+	canvas_clear(c);
 	wlr_scene_node_destroy(&c->scene->node);
 	printstatus();
 	motionnotify(0, NULL, 0, 0, 0, 0);
@@ -4011,6 +4357,9 @@ togglecanvas(const Arg *arg)
 		wl_list_for_each(c, &clients, link) {
 			if (c->mon == selmon && (c->tags & disabled)
 					&& !(c->tags & selmon->canvas_tags)) {
+				canvas_cancel_grab(c);
+				canvas_restore(c);
+				c->world_set = 0;
 				c->isfloating = 0;
 				wlr_scene_node_reparent(&c->scene->node, layers[LyrTile]);
 			}
@@ -4159,9 +4508,18 @@ configurex11(struct wl_listener *listener, void *data)
 		return;
 	}
 	if ((c->isfloating && c != grabc) || !c->mon->lt[c->mon->sellt]->arrange) {
+		if (canvas_active(c))
+			canvas_restore(c);
 		resize(c, (struct wlr_box){.x = event->x - c->bw,
 				.y = event->y - c->bw, .width = event->width + c->bw * 2,
 				.height = event->height + c->bw * 2}, 0);
+		if (canvas_active(c)) {
+			c->world_x = c->geom.x;
+			c->world_y = c->geom.y;
+			c->world_width = c->geom.width;
+			c->world_height = c->geom.height;
+			canvas_layout(c->mon);
+		}
 	} else {
 		arrange(c->mon);
 	}

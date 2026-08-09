@@ -22,7 +22,8 @@ buttons = {
 ```
 
 Zoom is built in: hold `logo` and use pointer scroll wheel while canvas tag is
-active. Zoom range is `0.2` through `3.0`.
+active. Zoom range is `0.2` through `3.0`. World point under pointer stays
+anchored while zoom changes.
 
 ## Using Canvas
 
@@ -83,13 +84,14 @@ Example:
 visible, all selected tag bits toggle together. For predictable independent
 canvas workspaces, switch to one tag before toggling canvas.
 
-## Current Zoom Limitation
+## Optical Zoom
 
-Zoom is geometric, not optical. mono asks clients to resize buffers rather than
-scaling already rendered textures. Some applications may reflow content or
-respond slowly while zooming.
+mono keeps each application at native canvas size and scales its rendered scene
+buffers, subsurfaces, popups, and borders. Applications do not reflow while
+zooming: terminal rows, browser layouts, and UI geometry remain stable.
 
-True optical zoom remains planned work.
+Fractional zoom uses bilinear filtering. User-initiated window resize still
+changes native application size, then current optical scale is reapplied.
 
 ## Recommended Bindings
 

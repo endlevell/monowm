@@ -111,8 +111,8 @@ While canvas is active:
 - windows can move beyond monitor boundaries
 - disabling canvas returns affected windows to dwindle layout
 
-Current zoom resizes client buffers rather than scaling rendered textures. See
-[Canvas Mode](docs/canvas.md) for behavior and limitations.
+Zoom scales rendered scene buffers without resizing applications. Content under
+mouse cursor stays anchored while zooming. See [Canvas Mode](docs/canvas.md).
 
 ## Documentation
 
@@ -152,7 +152,6 @@ build/              compositor build output
 
 ## Roadmap
 
-- [ ] True optical canvas zoom
 - [ ] Separate trackpad scrolling from mouse-wheel canvas zoom
 - [ ] Configurable keyboard layout/keymap
 - [ ] System config fallback at `/etc/mono/config.lua`
