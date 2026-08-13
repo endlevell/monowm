@@ -3674,9 +3674,6 @@ canvas_transform_tree(Client *c, struct wlr_scene_tree *tree, double scale)
 					state->surface_commit.notify = canvas_surface_commit;
 					wl_signal_add(&surface->surface->events.commit,
 							&state->surface_commit);
-					wl_list_remove(&state->surface_commit.link);
-					wl_list_insert(&surface->surface->events.commit.listener_list,
-							&state->surface_commit.link);
 				} else if (buffer->buffer) {
 					state->width = buffer->buffer->width;
 					state->height = buffer->buffer->height;
@@ -3810,10 +3807,20 @@ canvas_surface_commit(struct wl_listener *listener, void *data)
 {
 	CanvasNodeState *state = wl_container_of(listener, state, surface_commit);
 	Client *c = state->client;
-	canvas_restore(c);
-	if (!c->canvas_refresh)
-		c->canvas_refresh = wl_event_loop_add_idle(event_loop,
-				canvas_refresh_idle, c);
+	struct wlr_scene_buffer *buffer = wlr_scene_buffer_from_node(state->node);
+
+	if (!canvas_active(c))
+		return;
+
+	state->x = state->node->x;
+	state->y = state->node->y;
+	state->dst_width = buffer->dst_width;
+	state->dst_height = buffer->dst_height;
+	state->width = buffer->dst_width > 0 ? buffer->dst_width
+			: (buffer->buffer ? buffer->buffer->width : state->width);
+	state->height = buffer->dst_height > 0 ? buffer->dst_height
+			: (buffer->buffer ? buffer->buffer->height : state->height);
+	canvas_apply(c, c->mon->zoom);
 }
 
 static void
