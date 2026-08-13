@@ -2197,9 +2197,9 @@ mapnotify(struct wl_listener *listener, void *data)
 
 	if (c->mon == selmon && (c->mon->canvas_tags & c->mon->tagset[c->mon->seltags])) {
 		c->world_x = c->mon->m.x + c->mon->canvas_x
-				+ (cursor->x - c->mon->m.x) / c->mon->zoom;
+				+ (cursor->x - c->mon->m.x) / c->mon->zoom - c->geom.width / 2.0;
 		c->world_y = c->mon->m.y + c->mon->canvas_y
-				+ (cursor->y - c->mon->m.y) / c->mon->zoom;
+				+ (cursor->y - c->mon->m.y) / c->mon->zoom - c->geom.height / 2.0;
 		c->world_width = c->geom.width;
 		c->world_height = c->geom.height;
 		c->world_set = 1;
