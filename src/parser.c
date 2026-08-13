@@ -504,6 +504,9 @@ l_mono_bind(lua_State *L)
 
 	const char *combo = luaL_checkstring(L, 1);
 	luaL_checktype(L, 2, LUA_TFUNCTION);
+	if (!combo[0] || combo[0] == '+' || combo[strlen(combo) - 1] == '+'
+			|| strstr(combo, "++"))
+		return luaL_error(L, "invalid binding combo '%s'", combo);
 
 	CfgKeybind *kb = &cfg->keybinds[cfg->nkeybinds];
 	memset(kb, 0, sizeof(*kb));
@@ -517,11 +520,16 @@ l_mono_bind(lua_State *L)
 	char *saveptr = NULL;
 	char *tok = strtok_r(buf, "+", &saveptr);
 	char *last = tok;
+	if (!last)
+		return luaL_error(L, "binding combo must contain a key");
 	kb->mods = 0;
 	while (tok) {
 		char *next = strtok_r(NULL, "+", &saveptr);
 		if (next) {
-			kb->mods |= parse_modifier(tok);
+			uint32_t mod = parse_modifier(tok);
+			if (!mod)
+				return luaL_error(L, "unknown modifier '%s'", tok);
+			kb->mods |= mod;
 			last = next;
 		}
 		tok = next;
@@ -561,16 +569,147 @@ l_mono_action(lua_State *L)
 	return 0;
 }
 
+static int
+l_mono_config(lua_State *L)
+{
+	static const char *const sections[] = {
+		"sloppy_focus", "bypass_surface_visibility", "log_level",
+		"appearance", "input", "rules", "monitors", "keybinds", "buttons", "autostart",
+	};
+
+	luaL_checktype(L, 1, LUA_TTABLE);
+	for (size_t i = 0; i < sizeof(sections) / sizeof(sections[0]); i++) {
+		lua_getfield(L, 1, sections[i]);
+		if (!lua_isnil(L, -1))
+			lua_setglobal(L, sections[i]);
+		else
+			lua_pop(L, 1);
+	}
+	return 0;
+}
+
+static int
+l_mono_append(lua_State *L)
+{
+	const char *section = lua_tostring(L, lua_upvalueindex(1));
+	luaL_checktype(L, 1, LUA_TTABLE);
+	lua_getglobal(L, section);
+	if (lua_isnil(L, -1)) {
+		lua_pop(L, 1);
+		lua_newtable(L);
+	}
+	luaL_checktype(L, -1, LUA_TTABLE);
+	lua_pushvalue(L, 1);
+	lua_rawseti(L, -2, (lua_Integer)lua_rawlen(L, -2) + 1);
+	lua_setglobal(L, section);
+	return 0;
+}
+
+static int
+l_mono_autostart(lua_State *L)
+{
+	luaL_checkstring(L, 1);
+	lua_getglobal(L, "autostart");
+	if (lua_isnil(L, -1)) {
+		lua_pop(L, 1);
+		lua_newtable(L);
+	}
+	lua_pushvalue(L, 1);
+	lua_rawseti(L, -2, (lua_Integer)lua_rawlen(L, -2) + 1);
+	lua_setglobal(L, "autostart");
+	return 0;
+}
+
+static int
+l_mono_action_callback(lua_State *L)
+{
+	const char *action = lua_tostring(L, lua_upvalueindex(1));
+	char args[CFG_MAX_ARGS][CFG_MAX_STRLEN] = {{0}};
+	int nargs = (int)lua_rawlen(L, lua_upvalueindex(2));
+
+	for (int i = 0; i < nargs; i++) {
+		lua_rawgeti(L, lua_upvalueindex(2), i + 1);
+		strncpy(args[i], lua_tostring(L, -1), CFG_MAX_STRLEN - 1);
+		lua_pop(L, 1);
+	}
+	dispatch_action(action, args, nargs);
+	return 0;
+}
+
+static int
+l_mono_action_factory(lua_State *L)
+{
+	const char *action = lua_tostring(L, lua_upvalueindex(1));
+	int nargs = lua_gettop(L);
+	if (nargs > CFG_MAX_ARGS)
+		return luaL_error(L, "too many action arguments (maximum %d)", CFG_MAX_ARGS);
+
+	lua_pushstring(L, action);
+	lua_createtable(L, nargs, 0);
+	for (int i = 1; i <= nargs; i++) {
+		if (!lua_isstring(L, i) && !lua_isnumber(L, i))
+			return luaL_argerror(L, i, "string or number expected");
+		luaL_tolstring(L, i, NULL);
+		lua_rawseti(L, -2, i);
+	}
+	lua_pushcclosure(L, l_mono_action_callback, 2);
+	return 1;
+}
+
 static const luaL_Reg mono_lib[] = {
 	{"bind", l_mono_bind},
 	{"action", l_mono_action},
+	{"config", l_mono_config},
+	{"autostart", l_mono_autostart},
 	{NULL, NULL}
 };
+
+static void
+register_mono_builder(lua_State *L, const char *name, const char *section)
+{
+	lua_pushstring(L, section);
+	lua_pushcclosure(L, l_mono_append, 1);
+	lua_setfield(L, -2, name);
+}
+
+static void
+register_mono_action(lua_State *L, const char *name, const char *action)
+{
+	lua_pushstring(L, action);
+	lua_pushcclosure(L, l_mono_action_factory, 1);
+	lua_setfield(L, -2, name);
+}
 
 static void
 register_mono_api(lua_State *L)
 {
 	luaL_newlib(L, mono_lib);
+	register_mono_builder(L, "rule", "rules");
+	register_mono_builder(L, "monitor", "monitors");
+	register_mono_builder(L, "button", "buttons");
+
+	register_mono_action(L, "spawn", "spawn");
+	register_mono_action(L, "kill_client", "killclient");
+	register_mono_action(L, "toggle_floating", "togglefloating");
+	register_mono_action(L, "toggle_fullscreen", "togglefullscreen");
+	register_mono_action(L, "toggle_gaps", "togglegaps");
+	register_mono_action(L, "quit", "quit");
+	register_mono_action(L, "view", "view");
+	register_mono_action(L, "toggle_view", "toggleview");
+	register_mono_action(L, "tag", "tag");
+	register_mono_action(L, "toggle_tag", "toggletag");
+	register_mono_action(L, "view_shift", "viewshift");
+	register_mono_action(L, "tag_shift", "tagshift");
+	register_mono_action(L, "focus", "focusdir");
+	register_mono_action(L, "swap", "swapdir");
+	register_mono_action(L, "focus_monitor", "focusmon");
+	register_mono_action(L, "move_to_monitor", "tagmon");
+	register_mono_action(L, "layout", "setlayout");
+	register_mono_action(L, "move_resize", "moveresize");
+	register_mono_action(L, "toggle_canvas", "togglecanvas");
+	register_mono_action(L, "canvas_pan", "canvaspan");
+	register_mono_action(L, "move_center", "movecenter");
+	register_mono_action(L, "vt", "chvt");
 	lua_setglobal(L, "mono");
 }
 
