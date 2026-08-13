@@ -22,7 +22,7 @@ buttons = {
 ```
 
 Zoom is built in: hold `logo` and use pointer scroll wheel while canvas tag is
-active. Zoom range is `0.2` through `3.0`. World point under pointer stays
+active. Zoom range is `0.2` through `1.0`; `1.0` is native window size. World point under pointer stays
 anchored while zoom changes.
 
 ## Using Canvas

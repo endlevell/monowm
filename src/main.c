@@ -749,7 +749,7 @@ axisnotify(struct wl_listener *listener, void *data)
 				+ (cursor->x - selmon->m.x) / old_zoom;
 		double world_y = selmon->canvas_y
 				+ (cursor->y - selmon->m.y) / old_zoom;
-		selmon->zoom = MIN(3.0, MAX(0.2,
+		selmon->zoom = MIN(1.0, MAX(0.2,
 				old_zoom + (event->delta < 0 ? 0.1 : -0.1)));
 		selmon->canvas_x = world_x
 				- (cursor->x - selmon->m.x) / selmon->zoom;
