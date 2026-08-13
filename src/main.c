@@ -2203,6 +2203,7 @@ mapnotify(struct wl_listener *listener, void *data)
 		c->world_width = c->geom.width;
 		c->world_height = c->geom.height;
 		c->world_set = 1;
+		canvas_layout(c->mon);
 	}
 
 	printstatus();
