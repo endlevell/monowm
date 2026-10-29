@@ -3018,10 +3018,31 @@ static void
 on_config_reload(const Config *newcfg, void *ud)
 {
 	Monitor *m;
+	Client *c, *focused = selmon ? focustop(selmon) : NULL;
 	(void)ud;
 	cfg = *newcfg;
-	wl_list_for_each(m, &mons, link)
+
+	/* Palette changes must repaint existing scene nodes, not only new clients. */
+	if (root_bg)
+		wlr_scene_rect_set_color(root_bg, cfg.appearance.root_color);
+	wl_list_for_each(m, &mons, link) {
+		if (m->fullscreen_bg)
+			wlr_scene_rect_set_color(m->fullscreen_bg, cfg.appearance.fullscreen_bg);
 		arrange(m);
+	}
+	wl_list_for_each(c, &clients, link) {
+		if (client_is_unmanaged(c))
+			continue;
+		if (c->isurgent)
+			client_set_border_color(c, cfg.appearance.inner_urgent_color,
+				cfg.appearance.outer_urgent_color);
+		else if (c == focused)
+			client_set_border_color(c, cfg.appearance.inner_focus_color,
+				cfg.appearance.outer_focus_color);
+		else
+			client_set_border_color(c, cfg.appearance.inner_border_color,
+				cfg.appearance.outer_border_color);
+	}
 	printstatus();
 }
 

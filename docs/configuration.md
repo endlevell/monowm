@@ -138,6 +138,6 @@ append builders.
 
 mono watches the active config with inotify. Valid reload replaces runtime config
 and callbacks; errors retain the prior config. Immediate effects include bindings,
-mouse bindings, rules for new windows, gaps, and later action reads. Restart for
-existing input devices, monitor rules, existing border colors/sizes, root background,
-and autostart.
+mouse bindings, rules for new windows, gaps, root and fullscreen background colors,
+existing focused, inactive and urgent border colors, and later action reads.
+Restart for existing input devices, monitor rules, existing border sizes, and autostart.
