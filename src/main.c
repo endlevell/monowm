@@ -1520,6 +1520,7 @@ destroydecoration(struct wl_listener *listener, void *data)
 
 	wl_list_remove(&c->destroy_decoration.link);
 	wl_list_remove(&c->set_decoration_mode.link);
+	c->decoration = NULL;
 }
 
 void
@@ -1623,6 +1624,10 @@ destroynotify(struct wl_listener *listener, void *data)
 		wl_list_remove(&c->unmap.link);
 		wl_list_remove(&c->maximize.link);
 	}
+	/* The decoration can outlive its toplevel, e.g. when clients are torn
+	 * down at shutdown; its listeners must not point into freed memory */
+	if (c->decoration)
+		destroydecoration(&c->destroy_decoration, NULL);
 	free(c);
 }
 
