@@ -780,6 +780,10 @@ buttonpress(struct wl_listener *listener, void *data)
 
 	switch (event->state) {
 	case WL_POINTER_BUTTON_STATE_PRESSED:
+		/* Another button during a move/resize/drag/pan must not reset the
+		 * grab; releasing a button is what finishes it */
+		if (cursor_mode != CurNormal && cursor_mode != CurPressed)
+			return;
 		cursor_mode = CurPressed;
 		selmon = xytomon(cursor->x, cursor->y);
 		if (locked)
@@ -4214,6 +4218,11 @@ unmapnotify(struct wl_listener *listener, void *data)
 	/* Called when the surface is unmapped, and should no longer be shown. */
 	Client *c = wl_container_of(listener, c, unmap);
 	if (c == grabc) {
+		if (cursor_mode == CurTileDrag) {
+			preselect_target = NULL;
+			preselect_edge = EDGE_NONE;
+			wlr_scene_node_set_enabled(&preselect_indicator->node, false);
+		}
 		cursor_mode = CurNormal;
 		grabc = NULL;
 	}

@@ -9,11 +9,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <limits.h>
+#include <math.h>
 #include <time.h>
 #include <unistd.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <sys/inotify.h>
+#include <sys/stat.h>
 #include <linux/input-event-codes.h>
 #include <xkbcommon/xkbcommon.h>
 #include <wayland-server-core.h>
@@ -41,8 +44,10 @@ static Config *g_loading_cfg = NULL;
 
 typedef struct {
 	int                  inotify_fd;
-	int                  watch_fd;
+	int                  dir_wd;  /* config's directory: saves, renames, recreation */
+	int                  file_wd; /* symlink target, or -1 if path is not a symlink */
 	char                 path[1024];
+	const char          *name;    /* basename within path */
 	config_reload_cb     cb;
 	void                *userdata;
 	struct wl_event_source *event_src;
@@ -73,15 +78,38 @@ lua_get_string(lua_State *L, const char *key, char *buf, size_t bufsz)
 	return ok;
 }
 
-/* Get an integer field. It falls back to `def` if missing or wrong type */
+/* Get an integer field. It falls back to `def` if missing or wrong type.
+ * Fractional values round instead of becoming 0 as lua_tointeger would. */
 
 static int
 lua_get_int(lua_State *L, const char *key, int def)
 {
 	lua_getfield(L, -1, key);
-	int val = lua_isnumber(L, -1) ? (int)lua_tointeger(L, -1) : def;
+	int val = def;
+	if (lua_isnumber(L, -1)) {
+		lua_Number n = round(lua_tonumber(L, -1));
+		if (n >= INT_MIN && n <= INT_MAX)
+			val = (int)n;
+		else
+			fprintf(stderr, "mono config: '%s' out of range, using %d\n",
+			        key, def);
+	}
 	lua_pop(L, 1);
 	return val;
+}
+
+/* Sizes such as border widths and gaps; negative values use `def` */
+
+static unsigned int
+lua_get_size(lua_State *L, const char *key, unsigned int def)
+{
+	int val = lua_get_int(L, key, (int)def);
+	if (val < 0) {
+		fprintf(stderr, "mono config: '%s' must not be negative, using %u\n",
+		        key, def);
+		return def;
+	}
+	return (unsigned int)val;
 }
 
 static double
@@ -111,15 +139,29 @@ parse_color_hex(uint32_t hex, float out[4])
 	out[3] = ( hex        & 0xFF) / 255.0f;
 }
 
+/* Accepts 0xRRGGBBAA numbers and "#RRGGBB" / "#RRGGBBAA" strings */
+
 static void
 lua_get_color(lua_State *L, const char *key, float out[4],
               float r, float g, float b, float a)
 {
+	const char *str;
+	size_t len;
+
+	out[0] = r; out[1] = g; out[2] = b; out[3] = a;
 	lua_getfield(L, -1, key);
-	if (lua_isnumber(L, -1))
+	if (lua_isinteger(L, -1) && lua_tointeger(L, -1) >= 0
+			&& lua_tointeger(L, -1) <= 0xFFFFFFFF) {
 		parse_color_hex((uint32_t)lua_tointeger(L, -1), out);
-	else {
-		out[0] = r; out[1] = g; out[2] = b; out[3] = a;
+	} else if (lua_type(L, -1) == LUA_TSTRING
+			&& (str = lua_tostring(L, -1))[0] == '#'
+			&& ((len = strlen(str + 1)) == 6 || len == 8)
+			&& strspn(str + 1, "0123456789abcdefABCDEF") == len) {
+		uint32_t v = (uint32_t)strtoul(str + 1, NULL, 16);
+		parse_color_hex(len == 6 ? v << 8 | 0xFF : v, out);
+	} else if (!lua_isnil(L, -1)) {
+		fprintf(stderr, "mono config: bad color for '%s', expected "
+		        "0xRRGGBBAA or \"#RRGGBB[AA]\", using default\n", key);
 	}
 	lua_pop(L, 1);
 }
@@ -192,9 +234,9 @@ parse_appearance(lua_State *L, CfgAppearance *a)
 		return;
 	}
 
-	a->inner_border_px = (unsigned int)lua_get_int(L, "inner_border_px", 1);
-	a->outer_border_px = (unsigned int)lua_get_int(L, "outer_border_px", 1);
-	a->gaps       = (unsigned int)lua_get_int(L, "gaps",       10);
+	a->inner_border_px = lua_get_size(L, "inner_border_px", 1);
+	a->outer_border_px = lua_get_size(L, "outer_border_px", 1);
+	a->gaps       = lua_get_size(L, "gaps",       10);
 	a->smart_gaps = lua_get_bool(L, "smart_gaps", false);
 
 	lua_get_color(L, "root_color",          a->root_color,          0.133f,0.133f,0.133f,1.f);
@@ -205,16 +247,7 @@ parse_appearance(lua_State *L, CfgAppearance *a)
 	lua_get_color(L, "inner_urgent_color",  a->inner_urgent_color,  1.f,0.f,0.f,1.f);
 	lua_get_color(L, "outer_urgent_color",  a->outer_urgent_color,  1.f,0.f,0.f,1.f);
 
-	lua_getfield(L, -1, "fullscreen_bg");
-	if (lua_isnumber(L, -1))
-		parse_color_hex((uint32_t)lua_tointeger(L, -1), a->fullscreen_bg);
-	else {
-		a->fullscreen_bg[0] = 0.f;
-		a->fullscreen_bg[1] = 0.f;
-		a->fullscreen_bg[2] = 0.f;
-		a->fullscreen_bg[3] = 1.f;
-	}
-	lua_pop(L, 1);
+	lua_get_color(L, "fullscreen_bg",       a->fullscreen_bg,       0.f,0.f,0.f,1.f);
 
 	lua_pop(L, 1); /* pop appearance table */
 }
@@ -882,10 +915,35 @@ config_autostart_run(const Config *cfg)
 /* inotify watcher */
 
 static int
+path_is_link(const char *path)
+{
+	struct stat st;
+	return lstat(path, &st) == 0 && S_ISLNK(st.st_mode);
+}
+
+/*
+ * Editing a symlinked config changes the link target, which the directory
+ * watch cannot see, so the target is watched too. Called again whenever the
+ * directory entry is replaced, since the link may now point elsewhere.
+ */
+static void
+watch_target(WatchState *ws)
+{
+	int wd = -1;
+
+	if (path_is_link(ws->path))
+		wd = inotify_add_watch(ws->inotify_fd, ws->path, IN_CLOSE_WRITE);
+	/* The IN_IGNORED this queues never triggers a reload */
+	if (ws->file_wd >= 0 && ws->file_wd != wd)
+		inotify_rm_watch(ws->inotify_fd, ws->file_wd);
+	ws->file_wd = wd;
+}
+
+static int
 watch_dispatch(int fd, uint32_t mask, void *data)
 {
 	WatchState *ws = data;
-	int changed = 0, lost = 0;
+	int changed = 0, replaced = 0;
 
 	/* Drain the inotify events */
 	_Alignas(struct inotify_event) char buf[4096];
@@ -896,28 +954,37 @@ watch_dispatch(int fd, uint32_t mask, void *data)
 		return 0;
 	}
 
+	/*
+	 * Watching the directory rather than the file keeps working when
+	 * editors save by delete-and-recreate or rename, which would orphan a
+	 * watch on the file's inode.
+	 */
 	for (char *p = buf; p < buf + len; ) {
 		const struct inotify_event *ev = (const struct inotify_event *)p;
-		if (ev->mask & IN_IGNORED)
-			lost = 1;	/* watched inode was replaced/removed */
-		else
-			changed = 1;
 		p += sizeof(*ev) + ev->len;
+
+		if (ev->wd == ws->file_wd) {
+			if (ev->mask & IN_IGNORED)
+				ws->file_wd = -1;
+			else if (ev->mask & IN_CLOSE_WRITE)
+				changed = 1;
+		} else if (ev->wd == ws->dir_wd) {
+			if (ev->mask & IN_IGNORED) {
+				fprintf(stderr, "mono config: config directory removed, "
+				        "hot reload stopped\n");
+				ws->dir_wd = -1;
+			} else if (ev->len && !strcmp(ev->name, ws->name)) {
+				/* A new regular file is still empty; its
+				 * IN_CLOSE_WRITE follows */
+				if ((ev->mask & IN_CREATE) && !path_is_link(ws->path))
+					continue;
+				changed = replaced = 1;
+			}
+		}
 	}
 
-	/*
-	 * Some editors (vim, nano) delete-and-recreate files on save, which
-	 * drops our watch and sends IN_IGNORED. Re-add the watch only in that
-	 * case. Never call inotify_rm_watch() unconditionally: it queues a new
-	 * IN_IGNORED event, which would wake us up again and reload the config
-	 * in an endless loop.
-	 */
-	if (lost) {
-		ws->watch_fd = inotify_add_watch(ws->inotify_fd, ws->path,
-		                                  IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE);
-		changed = 1;
-	}
-
+	if (replaced)
+		watch_target(ws);
 	if (!changed)
 		return 0;
 
@@ -952,16 +1019,30 @@ config_watch_start(struct wl_event_loop *loop, const char *path,
 		return NULL;
 	}
 
-	ws->watch_fd = inotify_add_watch(ws->inotify_fd, path,
-	                                  IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE);
-	if (ws->watch_fd < 0) {
+	strncpy(ws->path, path, sizeof(ws->path) - 1);
+	ws->file_wd = -1;
+
+	char dir[sizeof(ws->path)];
+	const char *slash = strrchr(ws->path, '/');
+	if (slash) {
+		size_t n = slash == ws->path ? 1 : (size_t)(slash - ws->path);
+		memcpy(dir, ws->path, n);
+		dir[n] = '\0';
+		ws->name = slash + 1;
+	} else {
+		strcpy(dir, ".");
+		ws->name = ws->path;
+	}
+
+	ws->dir_wd = inotify_add_watch(ws->inotify_fd, dir,
+	                               IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE);
+	if (ws->dir_wd < 0) {
 		perror("mono config: inotify_add_watch");
 		close(ws->inotify_fd);
 		free(ws);
 		return NULL;
 	}
-
-	strncpy(ws->path, path, sizeof(ws->path) - 1);
+	watch_target(ws);
 	ws->cb       = cb;
 	ws->userdata = userdata;
 

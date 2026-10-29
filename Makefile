@@ -96,9 +96,14 @@ install: $(MONO_BUILD)/mono $(SMSG_BUILD)/monomsg
 	cp -f $(SMSG_BUILD)/monomsg $(DESTDIR)$(PREFIX)/bin/monomsg
 	chmod 755 $(DESTDIR)$(PREFIX)/bin/monomsg
 	mkdir -p $(DESTDIR)/etc/mono
-	cp -r examples/* $(DESTDIR)/etc/mono
+	# keep an admin-edited config
+	[ -e $(DESTDIR)/etc/mono/config.lua ] || \
+		cp examples/config.lua $(DESTDIR)/etc/mono/config.lua
 
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/mono
 	rm -f $(DESTDIR)$(PREFIX)/bin/monomsg
-	rm -rf $(DESTDIR)/etc/mono
+	# only remove the config if it is still the unmodified example
+	if cmp -s examples/config.lua $(DESTDIR)/etc/mono/config.lua; then \
+		rm -f $(DESTDIR)/etc/mono/config.lua; fi
+	rmdir $(DESTDIR)/etc/mono 2>/dev/null || true

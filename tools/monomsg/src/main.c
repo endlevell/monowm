@@ -40,7 +40,7 @@ static char *focused_output;
 static uint32_t tagcount;
 static char *tagset;
 static char *layout_name;
-static size_t layoutcount, layout_idx;
+static size_t layoutcount, layout_idx = (size_t)-1; /* -1: no name matched */
 static char *client_tags;
 
 struct output {
@@ -106,9 +106,11 @@ dwl_ipc_output_tag(void *data, struct zdwl_ipc_output_v2 *dwl_ipc_output,
 	uint32_t tag, uint32_t state, uint32_t clients, uint32_t focused)
 {
 	if (!tflag) return;
-	if (state != ZDWL_IPC_OUTPUT_V2_TAG_STATE_NONE) seltags |= 1<<tag;
-	if (state == ZDWL_IPC_OUTPUT_V2_TAG_STATE_ACTIVE) urg |= 1<<tag;
-	if (clients > 0) occ |= 1<<tag;
+	/* state is a bitmask: a tag can be both active and urgent */
+	if (state & ZDWL_IPC_OUTPUT_V2_TAG_STATE_ACTIVE) seltags |= 1u<<tag;
+	if (state & ZDWL_IPC_OUTPUT_V2_TAG_STATE_URGENT) urg |= 1u<<tag;
+	if (clients > 0) occ |= 1u<<tag;
+	if (focused) sel |= 1u<<tag;
 	if (!(mode & GET)) return;
 	if (data) printf("%s ", (char *)data);
 	printf("tag %u %u %u %u\n", tag, state, clients, focused);
@@ -171,7 +173,8 @@ dwl_ipc_output_frame(void *data, struct zdwl_ipc_output_v2 *dwl_ipc_output)
 	if (mode & SET) {
 		if (data && !(output_name && strcmp(output_name, (char *)data) == 0)) return;
 		if (lflag) {
-			if (layout_idx == 0) {
+			if (layout_idx == (size_t)-1) {
+				layout_idx = 0;
 				for (char *c = layout_name; *c; c++) {
 					if (*c < '0' || *c > '9')
 						die("bad layout %s", layout_name);
@@ -196,23 +199,25 @@ dwl_ipc_output_frame(void *data, struct zdwl_ipc_output_v2 *dwl_ipc_output)
 			for (; *t && *t >= '0' && *t <= '9'; t++)
 				i = *t-'0' + i*10;
 
-			if (toggle && !*t) mask = 1<<i;
+			if (toggle && !*t) {
+				if (i >= tagcount) die("bad tagset %s", tagset);
+				mask = 1u<<i;
+			}
 
 			for (; *t; t++, i++) {
+				if (i >= tagcount) die("bad tagset %s", tagset);
 				switch (*t) {
 				case '-':
-					mask &= ~(1<<i);
+					mask &= ~(1u<<i);
 					break;
 				case '+':
-					mask |= 1<<i;
+					mask |= 1u<<i;
 					break;
 				case '^':
-					mask ^= 1<<i;
+					mask ^= 1u<<i;
 					break;
 				}
 			}
-
-			if (i > tagcount) die("bad tagset %s", tagset);
 
 			zdwl_ipc_output_v2_set_tags(dwl_ipc_output, mask, toggle);
 		}
@@ -225,25 +230,26 @@ dwl_ipc_output_frame(void *data, struct zdwl_ipc_output_v2 *dwl_ipc_output)
 				i = *t-'0' + i*10;
 
 			if (!*t) {
+				if (i >= tagcount) die("bad client tagset %s", client_tags);
 				and = 0;
-				xor = 1<<i;
+				xor = 1u<<i;
 			}
 
 			for (; *t; t++, i++) {
+				if (i >= tagcount) die("bad client tagset %s", client_tags);
 				switch (*t) {
 				case '-':
-					and &= ~(1<<i);
+					and &= ~(1u<<i);
 					break;
 				case '+':
-					and &= ~(1<<i);
-					xor |= 1<<i;
+					and &= ~(1u<<i);
+					xor |= 1u<<i;
 					break;
 				case '^':
-					xor |= 1<<i;
+					xor |= 1u<<i;
 					break;
 				}
 			}
-			if (i > tagcount) die("bad client tagset %s", client_tags);
 
 			zdwl_ipc_output_v2_set_client_tags(dwl_ipc_output, and, xor);
 		}
@@ -431,7 +437,7 @@ main(int argc, char *argv[])
 	case 'O':
 		Oflag = 1;
 		if (mode & SET) usage(1);
-		if (mode & WATCH)
+		if (mode == WATCH) /* WATCH includes the GET bit */
 			watch_outputs = 1;
 		else
 			mode = GET;

@@ -154,6 +154,8 @@ handle_ext_commit(struct wl_listener *listener, void *data)
 			}
 			if (!ws)
 				break;
+			/* view() acts on selmon; target the workspace's monitor */
+			selmon = ws->m;
 			view(&(Arg){.ui = 1 << (ws->tag - 1)});
 			break;
 
@@ -166,8 +168,10 @@ handle_ext_commit(struct wl_listener *listener, void *data)
 					break;
 				}
 			}
-			if (!ws)
+			/* toggleview() flips the tag, so only act on a shown one */
+			if (!ws || !(ws->m->tagset[ws->m->seltags] & (1 << (ws->tag - 1))))
 				break;
+			selmon = ws->m;
 			toggleview(&(Arg){.ui = 1 << (ws->tag - 1)});
 			break;
 

@@ -56,7 +56,7 @@ mono.bind("logo+return", mono.spawn(terminal))
 - `sloppy_focus`: focus window on pointer entry.
 - `bypass_surface_visibility`: count hidden-surface idle inhibitors.
 - `log_level`: `"silent"`, `"error"`, `"info"`, `"debug"`.
-- Colors: `0xRRGGBBAA`.
+- Colors: `0xRRGGBBAA`, or a `"#RRGGBB"` / `"#RRGGBBAA"` string.
 - `appearance.smart_gaps = true`: removes gaps with one tiled window.
 - Input strings: `scroll_method` is `"2fg"`, `"edge"`, `"button"`; `click_method`
   is `"button_areas"` or `"clickfinger"`; `accel_profile` is `"adaptive"` or `"flat"`.

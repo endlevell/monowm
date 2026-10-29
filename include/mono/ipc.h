@@ -68,10 +68,11 @@ ipc_send_output_state(IpcOutput *ipc_out)
 		uint32_t state  = ZDWL_IPC_OUTPUT_V2_TAG_STATE_NONE;
 		uint32_t clients_on_tag = 0;
 
+		/* Bitmask, as in dwl: a tag can be both active and urgent */
 		if (m->tagset[m->seltags] & mask)
-			state = ZDWL_IPC_OUTPUT_V2_TAG_STATE_ACTIVE;
+			state |= ZDWL_IPC_OUTPUT_V2_TAG_STATE_ACTIVE;
 		if (urg & mask)
-			state = ZDWL_IPC_OUTPUT_V2_TAG_STATE_URGENT;
+			state |= ZDWL_IPC_OUTPUT_V2_TAG_STATE_URGENT;
 		if (occ & mask)
 			clients_on_tag = 1; /* report ≥1, not exact count */
 
