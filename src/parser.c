@@ -255,13 +255,17 @@ parse_appearance(lua_State *L, CfgAppearance *a)
 static void
 parse_animations(lua_State *L, CfgAnimations *an)
 {
-	an->enabled  = true;
-	an->duration = 220;
+	an->enabled = true;
+	an->speed   = 1.0;
 
 	lua_getglobal(L, "animations");
 	if (lua_istable(L, -1)) {
-		an->enabled  = lua_get_bool(L, "enabled", true);
-		an->duration = (int)lua_get_size(L, "duration", 220);
+		an->enabled = lua_get_bool(L, "enabled", true);
+		an->speed   = lua_get_double(L, "speed", 1.0);
+		if (an->speed <= 0) {
+			fprintf(stderr, "mono config: animations.speed must be positive, using 1\n");
+			an->speed = 1.0;
+		}
 	}
 	lua_pop(L, 1);
 }
@@ -853,6 +857,22 @@ config_apply_keybinds(const Config *cfg)
 	(void)cfg;
 }
 
+/* Process groups of autostart runs (one per startup or reload that added
+ * commands) */
+static pid_t autostart_groups[CFG_MAX_AUTOSTART];
+static int nautostart_groups;
+
+/* Autostarted programs belong to this session. Left running, they outlive
+ * it, e.g. an audio server that keeps the next session from starting its
+ * own. Programs that detach into their own session are not affected. */
+void
+config_autostart_stop(void)
+{
+	for (int i = 0; i < nautostart_groups; i++)
+		kill(-autostart_groups[i], SIGTERM);
+	nautostart_groups = 0;
+}
+
 void
 config_autostart_run(const CfgAutostart *cmds, int n)
 {
@@ -864,8 +884,13 @@ config_autostart_run(const CfgAutostart *cmds, int n)
 		perror("mono autostart: fork");
 		return;
 	}
-	if (pid != 0)
+	if (pid != 0) {
+		/* The sequencer's setsid() makes pid the process group of
+		 * everything it starts; remember it for config_autostart_stop() */
+		if (nautostart_groups < CFG_MAX_AUTOSTART)
+			autostart_groups[nautostart_groups++] = pid;
 		return; /* compositor continues (sequencer runs in child) */
+	}
 
 	/* The sequencer child resets any inherited signal handlers and becomes
 	 * a new session so the compositor's SIGCHLD handling doesn't

@@ -8,9 +8,34 @@
  * while anything still moves. A start time of 0 means "not animating".
  */
 
-#define ANIM_POP_SCALE 0.85  /* size windows open from and close to */
-#define ANIM_GLIDE_MS  325.0 /* pan glide velocity decay time constant */
-#define ANIM_GLIDE_MIN 0.02  /* canvas units per ms below which a glide stops */
+#define ANIM_OPEN_SCALE  0.8   /* size windows pop in from */
+#define ANIM_CLOSE_SCALE 0.9   /* size closing windows shrink to */
+#define ANIM_GLIDE_MS    325.0 /* pan glide velocity decay time constant */
+#define ANIM_GLIDE_MIN   0.02  /* canvas units per ms below which a glide stops */
+
+/* Cubic bezier easing from (0,0) to (1,1) through (x1,y1) and (x2,y2), as in
+ * CSS and Hyprland */
+typedef struct {
+	double x1, y1, x2, y2;
+} Bezier;
+
+static const Bezier emphasized_decel = {0.05, 0.7, 0.1, 1.0};
+static const Bezier menu_decel       = {0.1, 1.0, 0.0, 1.0};
+static const Bezier standard_decel   = {0.0, 0.0, 0.0, 1.0};
+
+enum { ANIM_OPEN, ANIM_CLOSE, ANIM_MOVE, ANIM_WORKSPACE, ANIM_ZOOM };
+
+/* Duration at speed 1 and curve of each kind of animation */
+static const struct {
+	double ms;
+	const Bezier *curve;
+} anim_kinds[] = {
+	[ANIM_OPEN]      = { 300, &emphasized_decel },
+	[ANIM_CLOSE]     = { 200, &emphasized_decel },
+	[ANIM_MOVE]      = { 300, &emphasized_decel },
+	[ANIM_WORKSPACE] = { 700, &menu_decel },
+	[ANIM_ZOOM]      = { 300, &standard_decel },
+};
 
 /* A copy of a closing window's scene nodes, faded and shrunk after the
  * window itself is gone */
@@ -48,30 +73,60 @@ anim_schedule(void)
 			wlr_output_schedule_frame(m->wlr_output);
 }
 
+static int
+anim_enabled(void)
+{
+	return cfg.animations.enabled && cfg.animations.speed > 0;
+}
+
 /* Start time for a new animation, or 0 when animations are off */
 static uint32_t
 anim_start(void)
 {
 	uint32_t now;
-	if (!cfg.animations.enabled || cfg.animations.duration <= 0)
+	if (!anim_enabled())
 		return 0;
 	anim_schedule();
 	now = anim_now();
 	return now ? now : 1;
 }
 
-/* Eased progress, 0 to 1, of an animation that began at start */
+/* One coordinate of the bezier at parameter s */
 static double
-anim_progress(uint32_t start, uint32_t now)
+bezier_at(double p1, double p2, double s)
+{
+	double u = 1.0 - s;
+	return 3.0 * u * u * s * p1 + 3.0 * u * s * s * p2 + s * s * s;
+}
+
+/* Eased value at time fraction t: find s with x(s) = t, return y(s). x is
+ * monotonic for control points in [0, 1], so bisection always converges. */
+static double
+bezier_ease(const Bezier *b, double t)
+{
+	double lo = 0.0, hi = 1.0, s = t;
+	for (int i = 0; i < 24; i++) {
+		s = (lo + hi) / 2.0;
+		if (bezier_at(b->x1, b->x2, s) < t)
+			lo = s;
+		else
+			hi = s;
+	}
+	return bezier_at(b->y1, b->y2, s);
+}
+
+/* Eased progress of an animation of the given kind that began at start;
+ * exactly 1.0 once it has finished */
+static double
+anim_progress(int kind, uint32_t start, uint32_t now)
 {
 	double t;
-	if (!start || !cfg.animations.enabled || cfg.animations.duration <= 0)
+	if (!start || !anim_enabled())
 		return 1.0;
-	t = (double)(uint32_t)(now - start) / cfg.animations.duration;
+	t = (double)(uint32_t)(now - start) * cfg.animations.speed / anim_kinds[kind].ms;
 	if (t >= 1.0)
 		return 1.0;
-	t = 1.0 - t;
-	return 1.0 - t * t * t; /* ease-out cubic */
+	return bezier_ease(anim_kinds[kind].curve, t);
 }
 
 static int
@@ -84,7 +139,7 @@ anim_lerp(int a, int b, double t)
 static struct wlr_box
 client_displayed_geom(Client *c, uint32_t now)
 {
-	double t = anim_progress(c->geom_start, now);
+	double t = anim_progress(ANIM_MOVE, c->geom_start, now);
 	if (t >= 1.0)
 		return c->geom;
 	return (struct wlr_box){
@@ -164,7 +219,7 @@ client_render(Client *c)
 		return;
 
 	box = client_displayed_geom(c, now);
-	if (anim_progress(c->geom_start, now) >= 1.0)
+	if (anim_progress(ANIM_MOVE, c->geom_start, now) >= 1.0)
 		c->geom_start = 0;
 	if (canvas_active(c)) {
 		box.x = m->m.x + (int)round((c->world_x - m->m.x - m->canvas_x) * m->zoom);
@@ -175,8 +230,8 @@ client_render(Client *c)
 	y = box.y;
 
 	if (c->pop_start) {
-		t = anim_progress(c->pop_start, now);
-		s = ANIM_POP_SCALE + (1.0 - ANIM_POP_SCALE) * t;
+		t = anim_progress(ANIM_OPEN, c->pop_start, now);
+		s = ANIM_OPEN_SCALE + (1.0 - ANIM_OPEN_SCALE) * t;
 		/* Grow from the center of the frame */
 		x += (int)round(box.width * scale * (1.0 - s) / 2.0);
 		y += (int)round(box.height * scale * (1.0 - s) / 2.0);
@@ -187,7 +242,7 @@ client_render(Client *c)
 	}
 
 	if (c->slide_start) {
-		t = anim_progress(c->slide_start, now);
+		t = anim_progress(ANIM_WORKSPACE, c->slide_start, now);
 		x += anim_lerp(c->slide_from, c->slide_to, t);
 		if (t >= 1.0) {
 			c->slide_start = 0;
@@ -234,7 +289,7 @@ anim_view(Monitor *m, uint32_t old, uint32_t new)
 		entering = (c->tags & new) != 0;
 		/* Reverse from wherever a window is if it was already sliding */
 		off = c->slide_start
-				? anim_lerp(c->slide_from, c->slide_to, anim_progress(c->slide_start, now))
+				? anim_lerp(c->slide_from, c->slide_to, anim_progress(ANIM_WORKSPACE, c->slide_start, now))
 				: entering ? dir * m->m.width : 0;
 		c->slide_from = off;
 		c->slide_to = entering ? 0 : -dir * m->m.width;
@@ -318,7 +373,7 @@ pan_glide_tick(Monitor *m, uint32_t now)
 {
 	double dt = (double)(uint32_t)(now - m->pan_last), decay;
 
-	if (!cfg.animations.enabled || !(m->canvas_tags & m->tagset[m->seltags]))
+	if (!anim_enabled() || !(m->canvas_tags & m->tagset[m->seltags]))
 		return m->pan_glide = 0;
 	if (dt <= 0)
 		return 1;
@@ -406,8 +461,7 @@ anim_close(Client *c)
 	SnapshotPart *p;
 	int w = 0, h = 0;
 
-	if (!c->scene->node.enabled || c->leaving || !cfg.animations.enabled
-			|| cfg.animations.duration <= 0)
+	if (!c->scene->node.enabled || c->leaving || !anim_enabled())
 		return;
 	s = ecalloc(1, sizeof(*s));
 	if (!(s->tree = wlr_scene_tree_create(c->scene->node.parent))) {
@@ -440,8 +494,8 @@ snapshot_destroy(Snapshot *s)
 static int
 snapshot_render(Snapshot *s, uint32_t now)
 {
-	double t = anim_progress(s->start, now);
-	double k = 1.0 - (1.0 - ANIM_POP_SCALE) * t;
+	double t = anim_progress(ANIM_CLOSE, s->start, now);
+	double k = 1.0 - (1.0 - ANIM_CLOSE_SCALE) * t;
 	float a = (float)(1.0 - t), color[4];
 	SnapshotPart *p;
 
@@ -477,7 +531,7 @@ anim_tick(void)
 
 	wl_list_for_each(m, &mons, link) {
 		if (m->zoom_start) {
-			t = anim_progress(m->zoom_start, now);
+			t = anim_progress(ANIM_ZOOM, m->zoom_start, now);
 			if (t >= 1.0)
 				m->zoom_start = 0;
 			zoom_apply(m, m->zoom_from + (m->zoom_to - m->zoom_from) * t);

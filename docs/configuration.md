@@ -68,15 +68,22 @@ Input values apply when a device appears and again on every config reload.
 ```lua
 animations = {
 	enabled = true, -- false snaps everything into place
-	duration = 220, -- milliseconds
+	speed = 1.0,    -- 2 = twice as fast, 0.5 = half speed
 }
 ```
 
-Windows pop in when opened and fade out when closed, glide to new positions when
-the layout changes or they go fullscreen, and slide sideways when switching tags.
-On canvas tags, zoom eases toward each scroll step and a quick pan keeps gliding
-after release. Interactive moves and resizes follow the pointer without delay.
-Both settings reload live.
+Timing follows the end-4 Hyprland setup, with cubic bezier curves:
+
+| Animation | Duration | Curve |
+|---|---|---|
+| Window open: pop in from 80% and fade in | 300 ms | emphasized decel (0.05, 0.7, 0.1, 1) |
+| Window close: shrink to 90% and fade out | 200 ms | emphasized decel |
+| Window move: layout changes, fullscreen, drops | 300 ms | emphasized decel |
+| Workspace switch: slide sideways | 700 ms | menu decel (0.1, 1, 0, 1) |
+| Canvas zoom toward each scroll step | 300 ms | standard decel (0, 0, 0, 1) |
+
+A quick canvas pan keeps gliding after release. Interactive moves and resizes
+follow the pointer without delay. Both settings reload live.
 
 ## Ordered Builders
 
@@ -95,6 +102,9 @@ mono.autostart("mako")
   Button values: `left`, `middle`, `right`, numeric Linux input code string.
 - Autostart runs through `/bin/sh -c`, in order, after socket/backend startup. Reload
   runs only commands added since the previous config; existing ones never rerun.
+  When mono exits, it stops the programs it autostarted, so daemons such as
+  `pipewire` do not linger into the next login. Programs that detach into
+  their own session are left alone.
 
 Builders create their target array if absent. C parser limits still apply: 64 rules,
 16 monitor rules, 256 keybinds/buttons, 32 autostart commands.

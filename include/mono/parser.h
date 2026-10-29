@@ -36,8 +36,8 @@ typedef struct {
 } CfgAppearance;
 
 typedef struct {
-	bool enabled;
-	int  duration; /* ms */
+	bool   enabled;
+	double speed; /* multiplies every animation's speed; 2 = twice as fast */
 } CfgAnimations;
 
 /* Input */
@@ -151,6 +151,7 @@ void config_apply_input(const Config *cfg);
 void config_apply_keybinds(const Config *cfg);
 
 void config_autostart_run(const CfgAutostart *cmds, int n);
+void config_autostart_stop(void);
 
 typedef void (*config_reload_cb)(const Config *cfg, void *userdata);
 

@@ -26,7 +26,7 @@ mono.config {
 
 	animations = {
 		enabled = true,
-		duration = 220, -- ms
+		speed = 1.0, -- 2 = twice as fast
 	},
 
 	input = {

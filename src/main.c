@@ -924,6 +924,7 @@ cleanup(void)
 		kill(-child_pid, SIGTERM);
 		waitpid(child_pid, NULL, 0);
 	}
+	config_autostart_stop();
 	wlr_xcursor_manager_destroy(cursor_mgr);
 
 	destroykeyboardgroup(&kb_group->destroy, NULL);
@@ -2798,9 +2799,11 @@ rendermon(struct wl_listener *listener, void *data)
 		anim_schedule();
 
 	/* Render if no XDG clients have an outstanding resize and are visible on
-	 * this monitor. */
+	 * this monitor. A window gliding to its new size is clipped to the moving
+	 * frame, so it keeps rendering instead of freezing the animation. */
 	wl_list_for_each(c, &clients, link) {
-		if (c->resize && !c->isfloating && client_is_rendered_on_mon(c, m) && !client_is_stopped(c))
+		if (c->resize && !c->geom_start && !c->isfloating
+				&& client_is_rendered_on_mon(c, m) && !client_is_stopped(c))
 			goto skip;
 	}
 
@@ -2845,7 +2848,7 @@ requestmonstate(struct wl_listener *listener, void *data)
 void
 resize(Client *c, struct wlr_box geo, int interact)
 {
-	struct wlr_box *bbox, from;
+	struct wlr_box *bbox, from, target = c->geom;
 
 	if (!c->mon || !client_surface(c)->mapped)
 		return;
@@ -2858,8 +2861,12 @@ resize(Client *c, struct wlr_box geo, int interact)
 	applybounds(c, bbox);
 
 	/* Layout moves glide from where the window is shown now; interactive
-	 * moves follow the pointer directly. Canvas windows place themselves. */
-	if (interact || !c->placed || canvas_active(c))
+	 * moves follow the pointer directly. Canvas windows place themselves.
+	 * commitnotify() resizes to the same target on every client commit,
+	 * which must leave a running animation alone. */
+	if (wlr_box_equal(&target, &c->geom))
+		;
+	else if (interact || !c->placed || canvas_active(c))
 		c->geom_start = 0;
 	else if (!wlr_box_equal(&from, &c->geom) && (c->geom_start = anim_start()))
 		c->geom_from = from;
