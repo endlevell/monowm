@@ -85,16 +85,15 @@ mono -d
 
 ## Input or Monitor Change Did Not Reload
 
-Hot reload updates config and callbacks, but existing hardware objects retain
-some setup-time values.
+Every setting applies on reload, with two deliberate exceptions:
 
-Restart mono after changing:
+- A monitor rule is only re-applied when the rule matching that monitor changed,
+  so a layout picked at runtime is not reset by unrelated edits.
+- Autostart runs only newly added commands. Removing a command does not stop a
+  program that is already running.
 
-- input options
-- monitor scale, transform, position, or initial layout
-- existing window border width/color
-- root background color
-- autostart commands
+If nothing applied, check the log for `reload failed`: a Lua error keeps the
+previous config.
 
 ## XDG_RUNTIME_DIR Must Be Set
 

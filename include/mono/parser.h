@@ -143,7 +143,7 @@ void config_apply_input(const Config *cfg);
 
 void config_apply_keybinds(const Config *cfg);
 
-void config_autostart_run(const Config *cfg);
+void config_autostart_run(const CfgAutostart *cmds, int n);
 
 typedef void (*config_reload_cb)(const Config *cfg, void *userdata);
 

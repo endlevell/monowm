@@ -839,9 +839,9 @@ config_apply_keybinds(const Config *cfg)
 }
 
 void
-config_autostart_run(const Config *cfg)
+config_autostart_run(const CfgAutostart *cmds, int n)
 {
-	if (cfg->nautostart == 0)
+	if (n == 0)
 		return;
 
 	pid_t pid = fork();
@@ -861,8 +861,8 @@ config_autostart_run(const Config *cfg)
 	 * as spawn() does */
 	dup2(STDERR_FILENO, STDOUT_FILENO);
 
-	for (int i = 0; i < cfg->nautostart; i++) {
-		const char *cmd = cfg->autostart[i].cmd;
+	for (int i = 0; i < n; i++) {
+		const char *cmd = cmds[i].cmd;
 
 		pid_t cpid = fork();
 		if (cpid < 0) {

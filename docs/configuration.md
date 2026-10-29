@@ -61,7 +61,7 @@ mono.bind("logo+return", mono.spawn(terminal))
 - Input strings: `scroll_method` is `"2fg"`, `"edge"`, `"button"`; `click_method`
   is `"button_areas"` or `"clickfinger"`; `accel_profile` is `"adaptive"` or `"flat"`.
 
-Input values apply when a device appears. Restart after changing input setup.
+Input values apply when a device appears and again on every config reload.
 
 ## Ordered Builders
 
@@ -79,7 +79,7 @@ mono.autostart("mako")
 - Button modifiers: `shift`, `ctrl`, `alt`, `logo`, `mod2`, `mod3`, `mod5`.
   Button values: `left`, `middle`, `right`, numeric Linux input code string.
 - Autostart runs through `/bin/sh -c`, in order, after socket/backend startup. Reload
-  never reruns it.
+  runs only commands added since the previous config; existing ones never rerun.
 
 Builders create their target array if absent. C parser limits still apply: 64 rules,
 16 monitor rules, 256 keybinds/buttons, 32 autostart commands.
@@ -137,7 +137,14 @@ append builders.
 ## Hot Reload
 
 mono watches the active config with inotify. Valid reload replaces runtime config
-and callbacks; errors retain the prior config. Immediate effects include bindings,
-mouse bindings, rules for new windows, gaps, root and fullscreen background colors,
-existing focused, inactive and urgent border colors, and later action reads.
-Restart for existing input devices, monitor rules, existing border sizes, and autostart.
+and callbacks; errors retain the prior config. Everything applies without a restart:
+
+- bindings, mouse bindings, rules for new windows, and later action reads
+- input settings (key repeat, libinput options) on connected devices
+- gaps; switching between zero and non-zero gaps turns them on or off everywhere,
+  otherwise each monitor keeps its `togglegaps` state
+- border sizes and colors on existing windows, root and fullscreen backgrounds
+- monitor rules: a monitor whose matching rule changed gets its scale, transform,
+  position, and layout re-applied; unchanged rules leave runtime layout switches alone
+- autostart: newly added commands run; existing ones do not rerun, and removed
+  ones keep running until stopped by hand

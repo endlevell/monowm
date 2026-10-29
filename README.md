@@ -83,9 +83,8 @@ end)
 ```
 
 Configuration supports normal Lua code, loops, helper functions, and modules.
-Saving valid config replaces runtime callbacks and settings. Input devices,
-monitor setup, existing decorations, and autostart still require restart after
-relevant changes.
+Saving valid config applies it live: bindings, input, monitor rules, borders,
+gaps, and newly added autostart commands, with no restart.
 
 See [Configuration](docs/configuration.md) and the commented
 [`examples/config.lua`](examples/config.lua).

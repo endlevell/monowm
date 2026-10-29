@@ -291,6 +291,13 @@ typedef struct {
 	struct wl_listener destroy;
 } PointerConstraint;
 
+/* libinput pointer, kept so config reloads can re-apply input settings */
+typedef struct {
+	struct libinput_device *device;
+	struct wl_listener destroy;
+	struct wl_list link;
+} Pointer;
+
 typedef struct {
 	const char *id;
 	const char *title;
@@ -353,8 +360,10 @@ static void createkeyboard(struct wlr_keyboard *keyboard);
 static KeyboardGroup *createkeyboardgroup(void);
 static void createlayersurface(struct wl_listener *listener, void *data);
 static void createlocksurface(struct wl_listener *listener, void *data);
+static void applymonrule(Monitor *m, const CfgMonitorRule *r, struct wlr_output_state *state);
 static void createmon(struct wl_listener *listener, void *data);
 static void createnotify(struct wl_listener *listener, void *data);
+static void configurepointer(struct libinput_device *device);
 static void createpointer(struct wlr_pointer *pointer);
 static void createpointerconstraint(struct wl_listener *listener, void *data);
 static void createpopup(struct wl_listener *listener, void *data);
@@ -368,6 +377,7 @@ static void destroylayersurfacenotify(struct wl_listener *listener, void *data);
 static void destroylock(SessionLock *lock, int unlocked);
 static void destroylocksurface(struct wl_listener *listener, void *data);
 static void destroynotify(struct wl_listener *listener, void *data);
+static void destroypointer(struct wl_listener *listener, void *data);
 static void destroypointerconstraint(struct wl_listener *listener, void *data);
 static void destroysessionlock(struct wl_listener *listener, void *data);
 static void destroykeyboardgroup(struct wl_listener *listener, void *data);
@@ -516,6 +526,7 @@ static struct wlr_box tiledrag_orig_geom;
 static struct wlr_output_layout *output_layout;
 static struct wlr_box sgeom;
 static struct wl_list mons;
+static struct wl_list pointers; /* Pointer.link */
 static Monitor *selmon;
 
 /* global event handlers */
@@ -1244,6 +1255,62 @@ createlocksurface(struct wl_listener *listener, void *data)
 		client_notify_enter(lock_surface->surface, wlr_seat_get_keyboard(seat));
 }
 
+/* First monitor rule matching output o, or NULL */
+static const CfgMonitorRule *
+monrule(struct wlr_output *o, const CfgMonitorRule *rules, int n)
+{
+	for (int i = 0; i < n; i++)
+		if (!rules[i].name[0] || strstr(o->name, rules[i].name))
+			return &rules[i];
+	return NULL;
+}
+
+static int
+monrule_equal(const CfgMonitorRule *a, const CfgMonitorRule *b)
+{
+	if (!a || !b)
+		return a == b;
+	return !strcmp(a->name, b->name) && a->mfact == b->mfact
+			&& a->nmaster == b->nmaster && a->scale == b->scale
+			&& !strcmp(a->layout, b->layout) && a->transform == b->transform
+			&& a->x == b->x && a->y == b->y;
+}
+
+/* Set m's layout state from rule r and stage its scale and transform in
+ * state. A NULL rule gets the defaults of the implicit rule
+ * parse_monitors() adds when the config has no monitors table. */
+void
+applymonrule(Monitor *m, const CfgMonitorRule *r, struct wlr_output_state *state)
+{
+	const char *layout = r ? r->layout : "dwindle";
+
+	m->mfact = r ? r->mfact : 0.55f;
+	m->nmaster = r ? r->nmaster : 1;
+	m->lt[0] = &layouts[0]; /* unknown layout name: floating */
+	for (size_t i = 0; i < LENGTH(layouts); i++) {
+		if ((layouts[i].symbol && !strcmp(layout, layouts[i].symbol))
+				|| (!strcmp(layout, "dwindle") && layouts[i].arrange == dwindle)) {
+			m->lt[0] = &layouts[i];
+			break;
+		}
+	}
+	m->lt[1] = &layouts[LENGTH(layouts) > 1 && m->lt[0] != &layouts[1]];
+	m->sellt = 0;
+	strncpy(m->ltsymbol, m->lt[0]->symbol, LENGTH(m->ltsymbol));
+	wlr_output_state_set_scale(state, r ? r->scale : 1.0f);
+	wlr_output_state_set_transform(state, r ? r->transform : WL_OUTPUT_TRANSFORM_NORMAL);
+}
+
+/* Put m in the output layout at rule r's position, or auto-place it */
+static void
+placemon(Monitor *m, const CfgMonitorRule *r)
+{
+	if (!r || (r->x == -1 && r->y == -1))
+		wlr_output_layout_add_auto(output_layout, m->wlr_output);
+	else
+		wlr_output_layout_add(output_layout, m->wlr_output, r->x, r->y);
+}
+
 void
 createmon(struct wl_listener *listener, void *data)
 {
@@ -1252,6 +1319,7 @@ createmon(struct wl_listener *listener, void *data)
 	struct wlr_output *wlr_output = data;
 	size_t i;
 	struct wlr_output_state state;
+	const CfgMonitorRule *rule;
 	Monitor *m;
 
 	if (!wlr_output_init_render(wlr_output, alloc, drw))
@@ -1268,45 +1336,8 @@ createmon(struct wl_listener *listener, void *data)
 	m->tagset[0] = m->tagset[1] = 1;
 	m->gaps = (cfg.appearance.gaps > 0) ? 1 : 0;
 	m->zoom = 1.0;
-	/* Defaults for outputs no monitor rule matches; mirrors the implicit
-	 * rule parse_monitors() uses when the config has no monitors table */
-	m->m.x = m->m.y = -1;
-	m->mfact = 0.55f;
-	m->nmaster = 1;
-	m->lt[0] = &layouts[LENGTH(layouts) > 1];
-	m->lt[1] = &layouts[0];
-	strncpy(m->ltsymbol, m->lt[0]->symbol, LENGTH(m->ltsymbol));
-	{
-		int ri;
-		for (ri = 0; ri < cfg.nmonitors; ri++) {
-			const CfgMonitorRule *r = &cfg.monitors[ri];
-			if (!r->name[0] || strstr(wlr_output->name, r->name)) {
-				m->m.x = r->x;
-				m->m.y = r->y;
-				m->mfact = r->mfact;
-				m->nmaster = r->nmaster;
-				/* Map layout name to layouts[] entry (it's not
-				 * very useful I know) */
-				m->lt[0] = &layouts[0]; /* default: floating */
-				for (int li = 0; li < (int)LENGTH(layouts); li++) {
-					if (layouts[li].symbol && !strcmp(r->layout, layouts[li].symbol)) {
-						m->lt[0] = &layouts[li];
-						break;
-					}
-					/* also match by arrange function name string */
-					if (!strcmp(r->layout, "dwindle") && layouts[li].arrange == dwindle) {
-						m->lt[0] = &layouts[li];
-						break;
-					}
-				}
-				m->lt[1] = &layouts[LENGTH(layouts) > 1 && m->lt[0] != &layouts[1]];
-				strncpy(m->ltsymbol, m->lt[m->sellt]->symbol, LENGTH(m->ltsymbol));
-				wlr_output_state_set_scale(&state, r->scale);
-				wlr_output_state_set_transform(&state, r->transform);
-				break;
-			}
-		}
-	}
+	rule = monrule(wlr_output, cfg.monitors, cfg.nmonitors);
+	applymonrule(m, rule, &state);
 
 	/* The mode is a tuple of (width, height, refresh rate), and each
 	 * monitor supports only a specific set of modes. We just pick the
@@ -1347,10 +1378,7 @@ createmon(struct wl_listener *listener, void *data)
 	 * output (such as DPI, scale factor, manufacturer, etc).
 	 */
 	m->scene_output = wlr_scene_output_create(scene, wlr_output);
-	if (m->m.x == -1 && m->m.y == -1)
-		wlr_output_layout_add_auto(output_layout, wlr_output);
-	else
-		wlr_output_layout_add(output_layout, wlr_output, m->m.x, m->m.y);
+	placemon(m, rule);
 }
 
 void
@@ -1377,44 +1405,53 @@ createnotify(struct wl_listener *listener, void *data)
 }
 
 void
+configurepointer(struct libinput_device *device)
+{
+	if (libinput_device_config_tap_get_finger_count(device)) {
+		libinput_device_config_tap_set_enabled(device, cfg.input.tap_to_click);
+		libinput_device_config_tap_set_drag_enabled(device, cfg.input.tap_and_drag);
+		libinput_device_config_tap_set_drag_lock_enabled(device, cfg.input.drag_lock);
+		libinput_device_config_tap_set_button_map(device, cfg.input.tap_button_map);
+	}
+
+	if (libinput_device_config_scroll_has_natural_scroll(device))
+		libinput_device_config_scroll_set_natural_scroll_enabled(device, cfg.input.natural_scrolling);
+
+	if (libinput_device_config_dwt_is_available(device))
+		libinput_device_config_dwt_set_enabled(device, cfg.input.disable_while_typing);
+
+	if (libinput_device_config_left_handed_is_available(device))
+		libinput_device_config_left_handed_set(device, cfg.input.left_handed);
+
+	if (libinput_device_config_middle_emulation_is_available(device))
+		libinput_device_config_middle_emulation_set_enabled(device, cfg.input.middle_button_emulation);
+
+	if (libinput_device_config_scroll_get_methods(device) != LIBINPUT_CONFIG_SCROLL_NO_SCROLL)
+		libinput_device_config_scroll_set_method(device, cfg.input.scroll_method);
+
+	if (libinput_device_config_click_get_methods(device) != LIBINPUT_CONFIG_CLICK_METHOD_NONE)
+		libinput_device_config_click_set_method(device, cfg.input.click_method);
+
+	if (libinput_device_config_send_events_get_modes(device))
+		libinput_device_config_send_events_set_mode(device, cfg.input.send_events_mode);
+
+	if (libinput_device_config_accel_is_available(device)) {
+		libinput_device_config_accel_set_profile(device, cfg.input.accel_profile);
+		libinput_device_config_accel_set_speed(device, cfg.input.accel_speed);
+	}
+}
+
+void
 createpointer(struct wlr_pointer *pointer)
 {
 	struct libinput_device *device;
 	if (wlr_input_device_is_libinput(&pointer->base)
 			&& (device = wlr_libinput_get_device_handle(&pointer->base))) {
-
-		if (libinput_device_config_tap_get_finger_count(device)) {
-			libinput_device_config_tap_set_enabled(device, cfg.input.tap_to_click);
-			libinput_device_config_tap_set_drag_enabled(device, cfg.input.tap_and_drag);
-			libinput_device_config_tap_set_drag_lock_enabled(device, cfg.input.drag_lock);
-			libinput_device_config_tap_set_button_map(device, cfg.input.tap_button_map);
-		}
-
-		if (libinput_device_config_scroll_has_natural_scroll(device))
-			libinput_device_config_scroll_set_natural_scroll_enabled(device, cfg.input.natural_scrolling);
-
-		if (libinput_device_config_dwt_is_available(device))
-			libinput_device_config_dwt_set_enabled(device, cfg.input.disable_while_typing);
-
-		if (libinput_device_config_left_handed_is_available(device))
-			libinput_device_config_left_handed_set(device, cfg.input.left_handed);
-
-		if (libinput_device_config_middle_emulation_is_available(device))
-			libinput_device_config_middle_emulation_set_enabled(device, cfg.input.middle_button_emulation);
-
-		if (libinput_device_config_scroll_get_methods(device) != LIBINPUT_CONFIG_SCROLL_NO_SCROLL)
-			libinput_device_config_scroll_set_method(device, cfg.input.scroll_method);
-
-		if (libinput_device_config_click_get_methods(device) != LIBINPUT_CONFIG_CLICK_METHOD_NONE)
-			libinput_device_config_click_set_method(device, cfg.input.click_method);
-
-		if (libinput_device_config_send_events_get_modes(device))
-			libinput_device_config_send_events_set_mode(device, cfg.input.send_events_mode);
-
-		if (libinput_device_config_accel_is_available(device)) {
-			libinput_device_config_accel_set_profile(device, cfg.input.accel_profile);
-			libinput_device_config_accel_set_speed(device, cfg.input.accel_speed);
-		}
+		Pointer *p = ecalloc(1, sizeof(*p));
+		p->device = device;
+		LISTEN(&pointer->base.events.destroy, &p->destroy, destroypointer);
+		wl_list_insert(&pointers, &p->link);
+		configurepointer(device);
 	}
 
 	wlr_cursor_attach_input_device(cursor, &pointer->base);
@@ -1587,6 +1624,15 @@ destroynotify(struct wl_listener *listener, void *data)
 		wl_list_remove(&c->maximize.link);
 	}
 	free(c);
+}
+
+void
+destroypointer(struct wl_listener *listener, void *data)
+{
+	Pointer *p = wl_container_of(listener, p, destroy);
+	wl_list_remove(&p->destroy.link);
+	wl_list_remove(&p->link);
+	free(p);
 }
 
 void
@@ -2858,7 +2904,7 @@ run(char *startup_cmd)
 	/* Launch autostart commands now that the socket is live and the backend
 	 * is running. Commands run sequentially in a detached child process so
 	 * the compositor never blocks. */
-	config_autostart_run(&cfg);
+	config_autostart_run(cfg.autostart, cfg.nautostart);
 
 	/* At this point the outputs are initialized, choose initial selmon based on
 	 * cursor position, and set default cursor image */
@@ -3023,19 +3069,53 @@ setsel(struct wl_listener *listener, void *data)
 static void
 on_config_reload(const Config *newcfg, void *ud)
 {
+	/* static: Config parts are large; reloads never nest */
+	static CfgMonitorRule oldrules[CFG_MAX_MONITORS];
+	static CfgAutostart added[CFG_MAX_AUTOSTART];
+	int noldrules = cfg.nmonitors, nadded = 0, i, j;
+	int gaps_switched = !cfg.appearance.gaps != !newcfg->appearance.gaps;
 	Monitor *m;
 	Client *c, *focused = selmon ? focustop(selmon) : NULL;
+	Pointer *p;
 	(void)ud;
+
+	/* Autostart only the commands this reload adds; the others still run */
+	for (i = 0; i < newcfg->nautostart; i++) {
+		for (j = 0; j < cfg.nautostart; j++)
+			if (!strcmp(newcfg->autostart[i].cmd, cfg.autostart[j].cmd))
+				break;
+		if (j == cfg.nautostart)
+			added[nadded++] = newcfg->autostart[i];
+	}
+	memcpy(oldrules, cfg.monitors, sizeof(oldrules));
 	cfg = *newcfg;
+
+	/* Input */
+	wlr_keyboard_set_repeat_info(&kb_group->wlr_group->keyboard,
+			cfg.input.repeat_rate, cfg.input.repeat_delay);
+	wl_list_for_each(p, &pointers, link)
+		configurepointer(p->device);
+
+	/* Re-apply a monitor rule only if it changed, so runtime layout
+	 * switches survive unrelated edits */
+	wl_list_for_each(m, &mons, link) {
+		const CfgMonitorRule *r = monrule(m->wlr_output, cfg.monitors, cfg.nmonitors);
+		struct wlr_output_state state;
+
+		if (monrule_equal(r, monrule(m->wlr_output, oldrules, noldrules)))
+			continue;
+		wlr_output_state_init(&state);
+		applymonrule(m, r, &state);
+		wlr_output_commit_state(m->wlr_output, &state);
+		wlr_output_state_finish(&state);
+		/* updatemons() keeps disabled outputs out of the layout */
+		if (m->wlr_output->enabled)
+			placemon(m, r);
+	}
 
 	/* Palette changes must repaint existing scene nodes, not only new clients. */
 	if (root_bg)
 		wlr_scene_rect_set_color(root_bg, cfg.appearance.root_color);
-	wl_list_for_each(m, &mons, link) {
-		if (m->fullscreen_bg)
-			wlr_scene_rect_set_color(m->fullscreen_bg, cfg.appearance.fullscreen_bg);
-		arrange(m);
-	}
 	wl_list_for_each(c, &clients, link) {
 		if (client_is_unmanaged(c))
 			continue;
@@ -3048,7 +3128,29 @@ on_config_reload(const Config *newcfg, void *ud)
 		else
 			client_set_border_color(c, cfg.appearance.inner_border_color,
 				cfg.appearance.outer_border_color);
+
+		/* Fullscreen windows pick up border sizes when they leave it */
+		if (c->isfullscreen || (c->ibw == cfg.appearance.inner_border_px
+				&& c->obw == cfg.appearance.outer_border_px))
+			continue;
+		c->ibw = cfg.appearance.inner_border_px;
+		c->obw = cfg.appearance.outer_border_px;
+		c->bw = c->ibw + c->obw;
+		/* Drop the canvas transform; arrange() below re-applies it */
+		canvas_restore(c);
+		resize(c, c->geom, 0);
 	}
+	wl_list_for_each(m, &mons, link) {
+		if (m->fullscreen_bg)
+			wlr_scene_rect_set_color(m->fullscreen_bg, cfg.appearance.fullscreen_bg);
+		/* Follow the config when gaps switch between zero and non-zero;
+		 * otherwise keep each monitor's togglegaps state */
+		if (gaps_switched)
+			m->gaps = cfg.appearance.gaps > 0;
+		arrange(m);
+	}
+	if (nadded)
+		config_autostart_run(added, nadded);
 	printstatus();
 }
 
@@ -3193,6 +3295,7 @@ setup(void)
 	/* Configure a listener to be notified when new outputs are available on the
 	 * backend. */
 	wl_list_init(&mons);
+	wl_list_init(&pointers);
 	wl_signal_add(&backend->events.new_output, &new_output);
 
 	/* Set up our client lists, the xdg-shell and the layer-shell. The xdg-shell is a
