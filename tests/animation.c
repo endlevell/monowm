@@ -605,6 +605,9 @@ static void canvas_toggle(void)
 	anim_tick();
 	assert(f.m.zoom == CANVAS_OVERVIEW_ZOOM && !f.m.zoom_start);
 	assert(f.buffer->dst_width == (int)round(992 * CANVAS_OVERVIEW_ZOOM));
+	/* The overview zoom must not leave a synthetic pan to recenter afterward. */
+	assert(f.m.backdrop_offset_x == 0 && f.m.backdrop_offset_y == 0);
+	assert(!anim_tick());
 	struct wlr_box overview = f.c.rendered;
 	int content_width = f.buffer->dst_width;
 	dispatch_action("togglecanvas", NULL, 0);
@@ -690,12 +693,35 @@ static void wallpaper(void)
 	 * native scene helpers, so new wallpaper buffers get a fresh baseline. */
 	bg.surface_commit.notify = commitlayersurfacenotify;
 	wl_list_insert(&f.surface->events.commit.listener_list, &bg.surface_commit.link);
-	f.m.backdrop_mix = 1;
+	/* Enter canvas at the user's slower speed. Wallpaper zoom is one
+	 * continuous transition, with no repositioning after it completes. */
+	f.m.canvas_tags = f.m.tagset[0] = 2;
+	cfg.animations.speed = 0.65;
+	anim_backdrop(&f.m, 1);
+	anim_zoom_at(&f.m, CANVAS_OVERVIEW_ZOOM,
+			f.m.m.x + f.m.m.width / 2.0, f.m.m.y + f.m.m.height / 2.0);
+	double previous_width = original.width;
+	for (now_ms = 1025; now_ms <= 1450; now_ms += 25) {
+		anim_tick();
+		assert(f.m.backdrop_offset_x == 0 && f.m.backdrop_offset_y == 0);
+		assert(native->src_box.width <= previous_width);
+		previous_width = native->src_box.width;
+	}
+	now_ms = 1462;
+	assert(!anim_tick());
+	struct wlr_fbox entered = native->src_box;
+	now_ms = 1800;
+	assert(!anim_tick());
+	assert(wlr_fbox_equal(&native->src_box, &entered));
+	cfg.animations.speed = 1;
+	f.m.backdrop_mix = 0;
 	/* Follow the actual middle-button drag path after navigating far from
 	 * the origin. Parallax must remain visible throughout an infinite canvas. */
 	f.m.canvas_x = 20 * f.m.m.width;
 	f.m.zoom = 0.6;
 	f.m.canvas_tags = f.m.tagset[0] = 2;
+	backdrop_update(&f.m);
+	f.m.backdrop_mix = 1;
 	backdrop_update(&f.m);
 	struct wlr_fbox far = native->src_box;
 	panmon = &f.m;

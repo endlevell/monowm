@@ -347,9 +347,15 @@ anim_view(Monitor *m, uint32_t old, uint32_t new)
 static void
 zoom_apply(Monitor *m, double zoom)
 {
+	double x = m->zoom_wx - m->zoom_ax / zoom;
+	double y = m->zoom_wy - m->zoom_ay / zoom;
+	/* Anchored zoom changes the camera origin without a pan gesture. Rebase
+	 * its wallpaper sample so this doesn't add a second settling animation. */
+	m->backdrop_camera_x += x - m->canvas_x;
+	m->backdrop_camera_y += y - m->canvas_y;
 	m->zoom = zoom;
-	m->canvas_x = m->zoom_wx - m->zoom_ax / zoom;
-	m->canvas_y = m->zoom_wy - m->zoom_ay / zoom;
+	m->canvas_x = x;
+	m->canvas_y = y;
 	canvas_layout(m);
 }
 
