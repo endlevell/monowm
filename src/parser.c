@@ -864,6 +864,7 @@ static int
 watch_dispatch(int fd, uint32_t mask, void *data)
 {
 	WatchState *ws = data;
+	int changed = 0, lost = 0;
 
 	/* Drain the inotify events */
 	_Alignas(struct inotify_event) char buf[4096];
@@ -873,6 +874,31 @@ watch_dispatch(int fd, uint32_t mask, void *data)
 			perror("mono config: inotify read");
 		return 0;
 	}
+
+	for (char *p = buf; p < buf + len; ) {
+		const struct inotify_event *ev = (const struct inotify_event *)p;
+		if (ev->mask & IN_IGNORED)
+			lost = 1;	/* watched inode was replaced/removed */
+		else
+			changed = 1;
+		p += sizeof(*ev) + ev->len;
+	}
+
+	/*
+	 * Some editors (vim, nano) delete-and-recreate files on save, which
+	 * drops our watch and sends IN_IGNORED. Re-add the watch only in that
+	 * case. Never call inotify_rm_watch() unconditionally: it queues a new
+	 * IN_IGNORED event, which would wake us up again and reload the config
+	 * in an endless loop.
+	 */
+	if (lost) {
+		ws->watch_fd = inotify_add_watch(ws->inotify_fd, ws->path,
+		                                  IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE);
+		changed = 1;
+	}
+
+	if (!changed)
+		return 0;
 
 	/* Re-parse */
 	Config *fresh = calloc(1, sizeof(Config));
@@ -888,16 +914,6 @@ watch_dispatch(int fd, uint32_t mask, void *data)
 	}
 
 	free(fresh);
-
-	/*
-	 * Some editors (vim, nano) delete-and-recreate files on save,
-	 * which removes our watch (which is a pain in the ass.
-	 * Hence, re-add it defensively. It's good for the soul)
-	 */
-	inotify_rm_watch(ws->inotify_fd, ws->watch_fd);
-	ws->watch_fd = inotify_add_watch(ws->inotify_fd, ws->path,
-	                                  IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE);
-
 	return 0;
 }
 
