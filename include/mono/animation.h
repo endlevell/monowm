@@ -387,6 +387,35 @@ anim_backdrop(Monitor *m, int canvas)
 	backdrop_update(m);
 }
 
+/* Use local camera movement, rather than an absolute world coordinate that
+ * saturates on an infinite canvas. Let the wallpaper settle after navigation. */
+static int
+backdrop_motion(Monitor *m, uint32_t now)
+{
+	int navigating = (cursor_mode == CurCanvasPan && panmon == m)
+			|| m->pan_glide || m->zoom_start;
+	if (!m->backdrop_last || m->backdrop_mix <= 0 || !anim_enabled()) {
+		m->backdrop_offset_x = m->backdrop_offset_y = 0;
+	} else {
+		double dt = (double)(uint32_t)(now - m->backdrop_last);
+		/* About 95% of the return happens within one zoom-animation duration. */
+		double decay = navigating ? 1.0
+				: exp(-3.0 * dt * cfg.animations.speed / anim_kinds[ANIM_ZOOM].ms);
+		double dx = 2.0 * (m->canvas_x - m->backdrop_camera_x) * m->zoom / MAX(1, m->m.width);
+		double dy = 2.0 * (m->canvas_y - m->backdrop_camera_y) * m->zoom / MAX(1, m->m.height);
+		m->backdrop_offset_x = MAX(-1.0, MIN(1.0, m->backdrop_offset_x * decay + dx));
+		m->backdrop_offset_y = MAX(-1.0, MIN(1.0, m->backdrop_offset_y * decay + dy));
+		if (fabs(m->backdrop_offset_x) < 0.001)
+			m->backdrop_offset_x = 0;
+		if (fabs(m->backdrop_offset_y) < 0.001)
+			m->backdrop_offset_y = 0;
+	}
+	m->backdrop_camera_x = m->canvas_x;
+	m->backdrop_camera_y = m->canvas_y;
+	m->backdrop_last = now;
+	return !navigating && (m->backdrop_offset_x != 0 || m->backdrop_offset_y != 0);
+}
+
 /* A pan is starting: settle any zoom or glide so they don't fight it */
 static void
 pan_begin(Monitor *m)
@@ -424,6 +453,11 @@ pan_track(Monitor *m)
 static void
 pan_release(Monitor *m)
 {
+	if (m->backdrop_offset_x != 0 || m->backdrop_offset_y != 0) {
+		/* A held, stationary drag may not have rendered for some time. */
+		m->backdrop_last = anim_now();
+		anim_schedule();
+	}
 	if ((uint32_t)(anim_now() - m->pan_last) > 50
 			|| hypot(m->pan_vx, m->pan_vy) < ANIM_GLIDE_MIN || !anim_start())
 		return;
@@ -664,6 +698,10 @@ anim_tick(void)
 		}
 		if (m->pan_glide)
 			active |= pan_glide_tick(m, now);
+		if (m->backdrop_offset_x != 0 || m->backdrop_offset_y != 0) {
+			active |= backdrop_motion(m, now);
+			backdrop_update(m);
+		}
 	}
 	wl_list_for_each(c, &clients, link) {
 		if (!c->geom_start && !c->pop_start && !c->slide_start)

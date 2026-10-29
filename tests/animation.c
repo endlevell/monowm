@@ -691,6 +691,39 @@ static void wallpaper(void)
 	bg.surface_commit.notify = commitlayersurfacenotify;
 	wl_list_insert(&f.surface->events.commit.listener_list, &bg.surface_commit.link);
 	f.m.backdrop_mix = 1;
+	/* Follow the actual middle-button drag path after navigating far from
+	 * the origin. Parallax must remain visible throughout an infinite canvas. */
+	f.m.canvas_x = 20 * f.m.m.width;
+	f.m.zoom = 0.6;
+	f.m.canvas_tags = f.m.tagset[0] = 2;
+	backdrop_update(&f.m);
+	struct wlr_fbox far = native->src_box;
+	panmon = &f.m;
+	cursor_mode = CurCanvasPan;
+	f.m.pan_start_cx = f.m.m.x + 400;
+	f.m.pan_start_cy = f.m.m.y + 200;
+	f.m.pan_start_ox = f.m.canvas_x;
+	f.m.pan_start_oy = f.m.canvas_y;
+	cursor->x = f.m.pan_start_cx - 120;
+	cursor->y = f.m.pan_start_cy;
+	motionnotify(0, NULL, 0, 0, 0, 0);
+	assert(f.m.canvas_x == f.m.pan_start_ox + 200);
+	assert(native->src_box.x > far.x + 1);
+	struct wlr_fbox dragged = native->src_box;
+	assert(!backdrop_motion(&f.m, now_ms)); /* A held, still drag needs no extra frames. */
+	panmon = NULL;
+	cursor_mode = CurNormal;
+	now_ms = 3000; /* Pause while holding the button, then release. */
+	pan_release(&f.m);
+	now_ms = 3050;
+	anim_tick();
+	assert(native->src_box.x < dragged.x && native->src_box.x > far.x);
+	now_ms = 4000;
+	anim_tick();
+	assert(wlr_fbox_equal(&native->src_box, &far));
+	f.m.canvas_tags = 0;
+	f.m.tagset[0] = 1;
+	f.m.canvas_x = 0;
 	backdrop_update(&f.m);
 	struct wlr_fbox initial = native->src_box;
 	assert(initial.width < 992 && initial.height < 692);
@@ -788,6 +821,9 @@ int main(int argc, char **argv)
 	scene = wlr_scene_create();
 	for (int i = 0; i < NUM_LAYERS; i++)
 		layers[i] = wlr_scene_tree_create(&scene->tree);
+	drag_icon = wlr_scene_tree_create(&scene->tree);
+	cursor = wlr_cursor_create();
+	assert(cursor);
 	cfg.animations.enabled = true;
 	cfg.animations.speed = 1;
 	if (argc == 1 || !strcmp(argv[1], "workspace")) workspace();
@@ -799,6 +835,7 @@ int main(int argc, char **argv)
 	if (argc == 1 || !strcmp(argv[1], "canvas")) canvas_toggle();
 	if (argc == 1 || !strcmp(argv[1], "wallpaper")) wallpaper();
 	wlr_scene_node_destroy(&scene->tree.node);
+	wlr_cursor_destroy(cursor);
 	wl_list_remove(&new_surface.link);
 	wl_registry_destroy(registry);
 	wl_compositor_destroy(client_compositor);

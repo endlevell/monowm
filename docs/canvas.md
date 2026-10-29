@@ -75,6 +75,9 @@ sense of depth. The wallpaper subtly zooms in to provide room for movement;
 movement is bounded so the image always fills its monitor. Leaving canvas
 smoothly restores its normal appearance.
 
+The shift responds to each pan and eases back after release, so it remains
+responsive even far from the canvas origin.
+
 This works with non-interactive background wallpapers such as `swaybg`. Panels,
 launchers, and interactive desktop surfaces keep their normal appearance and
 input behavior. Each monitor's wallpaper follows its own canvas.

@@ -286,6 +286,9 @@ struct Monitor {
 	double zoom_ax, zoom_ay, zoom_wx, zoom_wy;
 	uint32_t backdrop_start;
 	double backdrop_mix, backdrop_from, backdrop_to;
+	uint32_t backdrop_last;
+	double backdrop_camera_x, backdrop_camera_y;
+	double backdrop_offset_x, backdrop_offset_y;
 	/* Pan velocity in canvas units per ms; pan_glide keeps it moving after release */
 	double pan_vx, pan_vy;
 	double pan_px, pan_py; /* canvas position at pan_last */
@@ -769,8 +772,8 @@ backdrop_buffer_apply(struct wlr_scene_buffer *buffer, int sx, int sy, void *dat
 	wlr_fbox_transform(&src, &src, buffer->transform, bw, bh);
 	double scale = 1.0 + CANVAS_PARALLAX_OVERSCAN * m->backdrop_mix;
 	double width = src.width / scale, height = src.height / scale;
-	double x = tanh(m->canvas_x / MAX(1, m->m.width));
-	double y = tanh(m->canvas_y / MAX(1, m->m.height));
+	double x = m->backdrop_offset_x;
+	double y = m->backdrop_offset_y;
 	src.x += (src.width - width) * (0.5 + 0.5 * x);
 	src.y += (src.height - height) * (0.5 + 0.5 * y);
 	src.width = width;
@@ -813,6 +816,10 @@ static void
 backdrop_update(Monitor *m)
 {
 	LayerSurface *l;
+	int moved = m->canvas_x != m->backdrop_camera_x || m->canvas_y != m->backdrop_camera_y;
+	backdrop_motion(m, anim_now());
+	if (moved && m->backdrop_mix > 0)
+		anim_schedule();
 	wl_list_for_each(l, &m->layers[ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND], link)
 		if (!l->backdrop_refresh)
 			backdrop_apply(l);
