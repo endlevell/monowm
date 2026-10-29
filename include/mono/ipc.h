@@ -128,6 +128,20 @@ ipc_printstatus(void)
 	}
 }
 
+/* Detach outputs bound to a monitor that is being freed; their requests
+ * become no-ops until the client destroys them */
+static void
+ipc_cleanupmon(Monitor *m)
+{
+	IpcManager *mgr;
+	IpcOutput *out;
+
+	wl_list_for_each(mgr, &ipc_managers, link)
+		wl_list_for_each(out, &mgr->outputs, link)
+			if (out->mon == m)
+				out->mon = NULL;
+}
+
 /* zdwl_ipc_output_v2 requests */
 
 static void

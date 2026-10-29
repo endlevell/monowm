@@ -134,8 +134,37 @@ parse_modifier(const char *name)
 	if (!strcmp(name, "mod2"))  return WLR_MODIFIER_MOD2;
 	if (!strcmp(name, "mod3"))  return WLR_MODIFIER_MOD3;
 	if (!strcmp(name, "mod5"))  return WLR_MODIFIER_MOD5;
-	fprintf(stderr, "mono config: unknown modifier '%s', ignoring\n", name);
 	return 0;
+}
+
+/* Read the optional "mods" string array of the table at the stack top.
+ * Returns 0 on an unknown modifier, since dropping it would widen the bind. */
+static int
+lua_get_mods(lua_State *L, uint32_t *mods)
+{
+	int ok = 1;
+
+	*mods = 0;
+	lua_getfield(L, -1, "mods");
+	if (lua_istable(L, -1)) {
+		int nm = (int)lua_rawlen(L, -1);
+		for (int m = 1; m <= nm && ok; m++) {
+			lua_rawgeti(L, -1, m);
+			if (lua_isstring(L, -1)) {
+				const char *name = lua_tostring(L, -1);
+				uint32_t mod = parse_modifier(name);
+				if (!mod) {
+					fprintf(stderr, "mono config: unknown modifier '%s', skipping bind\n",
+					        name);
+					ok = 0;
+				}
+				*mods |= mod;
+			}
+			lua_pop(L, 1);
+		}
+	}
+	lua_pop(L, 1);
+	return ok;
 }
 
 /* Section parsers */
@@ -339,18 +368,10 @@ parse_keybinds(lua_State *L, Config *cfg)
 		kb->lua_ref = LUA_NOREF;
 
 		/* mods: array of strings */
-		kb->mods = 0;
-		lua_getfield(L, -1, "mods");
-		if (lua_istable(L, -1)) {
-			int nm = (int)lua_rawlen(L, -1);
-			for (int m = 1; m <= nm; m++) {
-				lua_rawgeti(L, -1, m);
-				if (lua_isstring(L, -1))
-					kb->mods |= parse_modifier(lua_tostring(L, -1));
-				lua_pop(L, 1);
-			}
+		if (!lua_get_mods(L, &kb->mods)) {
+			lua_pop(L, 1); /* keybind entry table */
+			continue;
 		}
-		lua_pop(L, 1);
 
 		/* key: string keysym name, e.g. "q", "Return", "XF86AudioMute" */
 		char keyname[CFG_MAX_STRLEN] = {0};
@@ -404,21 +425,13 @@ parse_buttons(lua_State *L, Config *cfg)
 		lua_rawgeti(L, -1, i);
 		if (!lua_istable(L, -1)) { lua_pop(L, 1); continue; }
 
-		CfgButton *b = &cfg->buttons[cfg->nbuttons++];
+		CfgButton *b = &cfg->buttons[cfg->nbuttons];
 		memset(b, 0, sizeof(*b));
 
-		b->mods = 0;
-		lua_getfield(L, -1, "mods");
-		if (lua_istable(L, -1)) {
-			int nm = (int)lua_rawlen(L, -1);
-			for (int m = 1; m <= nm; m++) {
-				lua_rawgeti(L, -1, m);
-				if (lua_isstring(L, -1))
-					b->mods |= parse_modifier(lua_tostring(L, -1));
-				lua_pop(L, 1);
-			}
+		if (!lua_get_mods(L, &b->mods)) {
+			lua_pop(L, 1); /* button entry table */
+			continue;
 		}
-		lua_pop(L, 1);
 
 		char btnname[CFG_MAX_STRLEN] = {0};
 		lua_get_string(L, "button", btnname, sizeof(btnname));
@@ -444,6 +457,7 @@ parse_buttons(lua_State *L, Config *cfg)
 		}
 		lua_pop(L, 1); /* args */
 
+		cfg->nbuttons++;
 		lua_pop(L, 1);
 	}
 	lua_pop(L, 1);
@@ -810,6 +824,9 @@ config_autostart_run(const Config *cfg)
 	 * interfere with our waitpid calls. */
 	signal(SIGCHLD, SIG_DFL);
 	setsid();
+	/* stdout may be the -s status pipe; keep command output out of it,
+	 * as spawn() does */
+	dup2(STDERR_FILENO, STDOUT_FILENO);
 
 	for (int i = 0; i < cfg->nautostart; i++) {
 		const char *cmd = cfg->autostart[i].cmd;
@@ -827,12 +844,16 @@ config_autostart_run(const Config *cfg)
 			_exit(1);
 		}
 
-		/* wait a second because one shotters will fly past, but
+		/* wait half a second because one shotters will fly past, but
 		 * daemon processes (some, like swaybg) won't because of
 		 * daemon black magic. To say the least, it's good for the soul */
 		struct timespec deadline, now;
 		clock_gettime(CLOCK_MONOTONIC, &deadline);
-		deadline.tv_sec += 0.5;
+		deadline.tv_nsec += 500 * 1000 * 1000;
+		if (deadline.tv_nsec >= 1000 * 1000 * 1000) {
+			deadline.tv_sec++;
+			deadline.tv_nsec -= 1000 * 1000 * 1000;
+		}
 
 		int status;
 		int done = 0;

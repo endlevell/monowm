@@ -124,6 +124,8 @@ typedef struct {
   double world_x, world_y;
   double world_width, world_height;
   int world_set;
+	int incanvas; /* placed by canvas_layout; undone by canvas_leave */
+	int canvas_wasfloating; /* isfloating before canvas forced it */
 	double visual_scale;
 	unsigned int canvas_generation;
 	struct wl_list canvas_nodes;
@@ -222,6 +224,7 @@ struct DwindleNode {
 	struct wlr_box box;
 	float          split_ratio;
 	int            split_top;
+	int            split_fixed; /* split_top chosen by an edge drop, not aspect */
 	int            is_node;
 };
 
@@ -317,6 +320,7 @@ static void canvas_new_subsurface(struct wl_listener *listener, void *data);
 static void canvas_surface_commit(struct wl_listener *listener, void *data);
 static void canvas_refresh_idle(void *data);
 static void canvas_restore(Client *c);
+static void canvas_leave(Client *c);
 static bool canvas_buffer_accepts_input(struct wlr_scene_buffer *buffer,
 		double *sx, double *sy);
 static void canvas_cancel_grab(Client *c);
@@ -492,6 +496,7 @@ static KeyboardGroup *kb_group;
 static unsigned int cursor_mode;
 static Client *grabc;
 static int grabcx, grabcy; /* client-relative */
+static Monitor *panmon; /* monitor whose canvas a CurCanvasPan drag moves */
 
 /* Tile-drag preselect recomputes every motion event while cursor_mode ==
  CurTileDrag edge == EDGE_NONE means "dead centre of target, do a plain
@@ -635,13 +640,10 @@ arrange(Monitor *m)
 		}
 	}
 	wl_list_for_each(c, &clients, link) {
-		if (c->mon == m && VISIBLEON(c, m) && !canvas_active(c)
-				&& !wl_list_empty(&c->canvas_nodes)) {
-			canvas_restore(c);
-			c->world_set = 0;
-			c->isfloating = 0;
-			wlr_scene_node_reparent(&c->scene->node, layers[LyrTile]);
-		}
+		/* Fullscreen stays in canvas so unfullscreen returns to its world spot */
+		if (c->mon == m && VISIBLEON(c, m) && c->incanvas
+				&& !canvas_active(c) && !c->isfullscreen)
+			canvas_leave(c);
 	}
 	if (m->canvas_tags & m->tagset[m->seltags]) {
 		canvas_layout(m);
@@ -794,6 +796,11 @@ buttonpress(struct wl_listener *listener, void *data)
 			const CfgButton *b = &cfg.buttons[i];
 			if (CLEANMASK(mods) == CLEANMASK(b->mods) &&
 					event->button == b->button) {
+				/* canvaspan only claims its button on canvas tags, so
+				 * e.g. middle-click paste still reaches clients elsewhere */
+				if (!strcmp(b->action, "canvaspan") && !(selmon
+						&& (selmon->canvas_tags & selmon->tagset[selmon->seltags])))
+					continue;
 				dispatch_action(b->action, b->args, b->nargs);
 				return;
 			}
@@ -805,6 +812,7 @@ buttonpress(struct wl_listener *listener, void *data)
 			wlr_cursor_set_xcursor(cursor, cursor_mgr, "default");
 			if (cursor_mode == CurCanvasPan) {
 				cursor_mode = CurNormal;
+				panmon = NULL;
 				return;
 			}
 			if (cursor_mode == CurTileDrag) {
@@ -923,6 +931,11 @@ cleanupmon(struct wl_listener *listener, void *data)
 
 	closemon(m);
 	ext_workspace_cleanupmon(m);
+	ipc_cleanupmon(m);
+	if (panmon == m) {
+		panmon = NULL;
+		cursor_mode = CurNormal;
+	}
 	for (int i = 0; i < TAGCOUNT; i++) {
 		dwindle_free_tree(m->dwindle_root[i]);
 		m->dwindle_root[i] = NULL;
@@ -1245,6 +1258,14 @@ createmon(struct wl_listener *listener, void *data)
 	m->tagset[0] = m->tagset[1] = 1;
 	m->gaps = (cfg.appearance.gaps > 0) ? 1 : 0;
 	m->zoom = 1.0;
+	/* Defaults for outputs no monitor rule matches; mirrors the implicit
+	 * rule parse_monitors() uses when the config has no monitors table */
+	m->m.x = m->m.y = -1;
+	m->mfact = 0.55f;
+	m->nmaster = 1;
+	m->lt[0] = &layouts[LENGTH(layouts) > 1];
+	m->lt[1] = &layouts[0];
+	strncpy(m->ltsymbol, m->lt[0]->symbol, LENGTH(m->ltsymbol));
 	{
 		int ri;
 		for (ri = 0; ri < cfg.nmonitors; ri++) {
@@ -1689,6 +1710,9 @@ void
 focusmon(const Arg *arg)
 {
 	int i = 0, nmons = wl_list_length(&mons);
+	/* selmon is NULL while every output is disabled */
+	if (!selmon)
+		return;
 	if (nmons) {
 		do /* don't switch to disabled mons */
 			selmon = dirtomon(arg->i);
@@ -2395,11 +2419,13 @@ motionnotify(uint32_t time, struct wlr_input_device *device, double dx, double d
 		}
 		return;
 	} else if (cursor_mode == CurCanvasPan) {
-		selmon->canvas_x = selmon->pan_start_ox
-				- (cursor->x - selmon->pan_start_cx) / selmon->zoom;
-		selmon->canvas_y = selmon->pan_start_oy
-				- (cursor->y - selmon->pan_start_cy) / selmon->zoom;
-		canvas_layout(selmon);
+		/* Pan the monitor the drag started on, even if selmon follows
+		 * the cursor onto another output */
+		panmon->canvas_x = panmon->pan_start_ox
+				- (cursor->x - panmon->pan_start_cx) / panmon->zoom;
+		panmon->canvas_y = panmon->pan_start_oy
+				- (cursor->y - panmon->pan_start_cy) / panmon->zoom;
+		canvas_layout(panmon);
 		return;
 	}
 
@@ -2435,10 +2461,11 @@ canvaspan(const Arg *arg)
 	if (!selmon || !(selmon->canvas_tags & selmon->tagset[selmon->seltags]))
 		return;
 	cursor_mode = CurCanvasPan;
-	selmon->pan_start_cx = cursor->x;
-	selmon->pan_start_cy = cursor->y;
-	selmon->pan_start_ox = selmon->canvas_x;
-	selmon->pan_start_oy = selmon->canvas_y;
+	panmon = selmon;
+	panmon->pan_start_cx = cursor->x;
+	panmon->pan_start_cy = cursor->y;
+	panmon->pan_start_ox = panmon->canvas_x;
+	panmon->pan_start_oy = panmon->canvas_y;
 	wlr_cursor_set_xcursor(cursor, cursor_mgr, "grab");
 }
 
@@ -2940,10 +2967,7 @@ setmon(Client *c, Monitor *m, uint32_t newtags)
 
 	if (oldmon == m)
 		return;
-	canvas_cancel_grab(c);
-	if (c->scene && !wl_list_empty(&c->canvas_nodes))
-		canvas_restore(c);
-	c->world_set = 0;
+	canvas_leave(c);
 	c->mon = m;
 	c->prev = c->geom;
 
@@ -3290,10 +3314,7 @@ tag(const Arg *arg)
 		return;
 
 	/* Remove from the source tag's dwindle tree */
-	canvas_cancel_grab(sel);
-	if (sel->scene && !wl_list_empty(&sel->canvas_nodes))
-		canvas_restore(sel);
-	sel->world_set = 0;
+	canvas_leave(sel);
 	dwindle_remove_client(sel);
 	sel->tags = arg->ui & TAGMASK;
 	focusclient(focustop(selmon), 1);
@@ -3385,7 +3406,8 @@ dwindle_recalc(DwindleNode *n, int gap)
 	}
 
 	/* Wider than tall -> split left/right; taller -> split top/bottom. */
-	n->split_top = (n->box.height > n->box.width);
+	if (!n->split_fixed)
+		n->split_top = (n->box.height > n->box.width);
 
 	if (!n->split_top) {
 		int w1 = MAX(1, (int)(n->box.width / 2.0f * n->split_ratio) - gap / 2);
@@ -3429,6 +3451,7 @@ dwindle_insert_at_edge(DwindleNode **root, Client *new_c, Client *target, Dwindl
 
 	int new_c_first = (edge == EDGE_LEFT || edge == EDGE_TOP);
 	new_parent->split_top   = (edge == EDGE_TOP || edge == EDGE_BOTTOM);
+	new_parent->split_fixed = 1;
 	new_parent->children[new_c_first ? 0 : 1] = new_leaf;
 	new_parent->children[new_c_first ? 1 : 0] = opening_on;
 
@@ -3766,6 +3789,38 @@ canvas_restore(Client *c)
 	c->visual_scale = 1.0;
 }
 
+/* Take c out of canvas placement. Its world position is converted back to
+ * the on-screen position, so a later canvas_layout maps it to the same world
+ * point, and the floating state from before canvas is restored. */
+static void
+canvas_leave(Client *c)
+{
+	Monitor *m = c->mon;
+	struct wlr_box *box;
+
+	canvas_cancel_grab(c);
+	if (c->scene)
+		canvas_restore(c);
+	if (!c->incanvas)
+		return;
+	c->incanvas = 0;
+
+	/* While fullscreen, geom is the monitor and prev holds the world box */
+	box = c->isfullscreen ? &c->prev : &c->geom;
+	if (c->world_set && m) {
+		box->x = m->m.x + (int)round((c->world_x - m->m.x - m->canvas_x) * m->zoom);
+		box->y = m->m.y + (int)round((c->world_y - m->m.y - m->canvas_y) * m->zoom);
+	}
+	c->world_set = 0;
+	c->isfloating = c->canvas_wasfloating;
+	if (c->isfullscreen || !c->scene)
+		return;
+	wlr_scene_node_reparent(&c->scene->node,
+			layers[c->isfloating ? LyrFloat : LyrTile]);
+	if (c->isfloating && m && client_surface(c)->mapped)
+		resize(c, c->geom, 0);
+}
+
 static void
 canvas_clear(Client *c)
 {
@@ -3850,6 +3905,10 @@ canvas_layout(Monitor *m)
 			c->world_width = c->geom.width;
 			c->world_height = c->geom.height;
 			c->world_set = 1;
+		}
+		if (!c->incanvas) {
+			c->incanvas = 1;
+			c->canvas_wasfloating = c->isfloating;
 		}
 		if (!c->isfloating) {
 			c->isfloating = 1;
@@ -3963,6 +4022,8 @@ togglefullscreen(const Arg *arg)
 void
 togglegaps(const Arg *arg)
 {
+	if (!selmon)
+		return;
 	selmon->gaps = !selmon->gaps;
 	arrange(selmon);
 }
@@ -4103,10 +4164,7 @@ toggletag(const Arg *arg)
 	if (!sel || !(newtags = sel->tags ^ (arg->ui & TAGMASK)))
 		return;
 
-	canvas_cancel_grab(sel);
-	if (sel->scene && !wl_list_empty(&sel->canvas_nodes))
-		canvas_restore(sel);
-	sel->world_set = 0;
+	canvas_leave(sel);
 	dwindle_remove_client(sel);
 	sel->tags = newtags;
 	focusclient(focustop(selmon), 1);
@@ -4360,17 +4418,12 @@ togglecanvas(const Arg *arg)
 	disabled = selmon->canvas_tags & tags;
 	selmon->canvas_tags ^= tags;
 
-	/* Leaving canvas returns its windows to the dwindle layout. */
+	/* Leaving canvas returns its windows to their pre-canvas layout state. */
 	if (disabled) {
 		wl_list_for_each(c, &clients, link) {
 			if (c->mon == selmon && (c->tags & disabled)
-					&& !(c->tags & selmon->canvas_tags)) {
-				canvas_cancel_grab(c);
-				canvas_restore(c);
-				c->world_set = 0;
-				c->isfloating = 0;
-				wlr_scene_node_reparent(&c->scene->node, layers[LyrTile]);
-			}
+					&& !(c->tags & selmon->canvas_tags))
+				canvas_leave(c);
 		}
 	}
 	arrange(selmon);

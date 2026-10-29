@@ -19,7 +19,7 @@ SMSG_BUILD = tools/monomsg/build
 
 all: $(MONO_BUILD)/mono $(SMSG_BUILD)/monomsg
 
-$(MONO_BUILD) $(SMSG_BUILD):
+$(MONO_BUILD) $(SMSG_BUILD) protocols/generated:
 	mkdir -p $@
 
 $(MONO_BUILD)/mono: $(MONO_BUILD)/main.o $(MONO_BUILD)/util.o \
@@ -52,23 +52,23 @@ $(MONO_BUILD)/dwl-ipc-unstable-v2-protocol.o: protocols/generated/dwl-ipc-unstab
 $(MONO_BUILD)/ext-workspace-v1-protocol.o: protocols/generated/ext-workspace-v1-protocol.c | $(MONO_BUILD)
 	$(CC) $(DWLCFLAGS) -o $@ -c $<
 
-protocols/generated/cursor-shape-v1-protocol.h:
+protocols/generated/cursor-shape-v1-protocol.h: | protocols/generated
 	$(SCANNER) enum-header $(PROTOCOLS)/staging/cursor-shape/cursor-shape-v1.xml $@
-protocols/generated/pointer-constraints-unstable-v1-protocol.h:
+protocols/generated/pointer-constraints-unstable-v1-protocol.h: | protocols/generated
 	$(SCANNER) enum-header $(PROTOCOLS)/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml $@
-protocols/generated/wlr-layer-shell-unstable-v1-protocol.h:
+protocols/generated/wlr-layer-shell-unstable-v1-protocol.h: | protocols/generated
 	$(SCANNER) enum-header protocols/xml/wlr-layer-shell-unstable-v1.xml $@
-protocols/generated/wlr-output-power-management-unstable-v1-protocol.h:
+protocols/generated/wlr-output-power-management-unstable-v1-protocol.h: | protocols/generated
 	$(SCANNER) server-header protocols/xml/wlr-output-power-management-unstable-v1.xml $@
-protocols/generated/xdg-shell-protocol.h:
+protocols/generated/xdg-shell-protocol.h: | protocols/generated
 	$(SCANNER) server-header $(PROTOCOLS)/stable/xdg-shell/xdg-shell.xml $@
-protocols/generated/dwl-ipc-unstable-v2-protocol.h:
+protocols/generated/dwl-ipc-unstable-v2-protocol.h: | protocols/generated
 	$(SCANNER) server-header protocols/xml/dwl-ipc-unstable-v2.xml $@
-protocols/generated/dwl-ipc-unstable-v2-protocol.c:
+protocols/generated/dwl-ipc-unstable-v2-protocol.c: | protocols/generated
 	$(SCANNER) private-code protocols/xml/dwl-ipc-unstable-v2.xml $@
-protocols/generated/ext-workspace-v1-protocol.h:
+protocols/generated/ext-workspace-v1-protocol.h: | protocols/generated
 	$(SCANNER) server-header protocols/xml/ext-workspace-v1.xml $@
-protocols/generated/ext-workspace-v1-protocol.c:
+protocols/generated/ext-workspace-v1-protocol.c: | protocols/generated
 	$(SCANNER) private-code protocols/xml/ext-workspace-v1.xml $@
 
 tools/monomsg/include/dwl-ipc-unstable-v2-protocol.h:
