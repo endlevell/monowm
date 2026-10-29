@@ -13,6 +13,7 @@ mono currently targets Linux and wlroots 0.20. Required packages:
 - `wlroots-0.20` with its libinput backend
 - `scenefx-0.5`, the scene renderer used for animations (needs EGL and GLESv2)
 - `libinput`
+- `pixman`
 - `xkbcommon`
 - `lua5.4`
 - `xcb` and `xcb-icccm` when XWayland support is enabled

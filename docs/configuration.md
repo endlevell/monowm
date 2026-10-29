@@ -72,18 +72,23 @@ animations = {
 }
 ```
 
-Timing follows the end-4 Hyprland setup, with cubic bezier curves:
+Timing uses cubic bezier curves from the end-4 Hyprland setup. Opening and closing
+use the same duration and easing:
 
 | Animation | Duration | Curve |
 |---|---|---|
 | Window open: pop in from 80% and fade in | 300 ms | emphasized decel (0.05, 0.7, 0.1, 1) |
-| Window close: shrink to 90% and fade out | 200 ms | emphasized decel |
-| Window move: layout changes, fullscreen, drops | 300 ms | emphasized decel |
+| Window close: shrink to 80% and fade out | 300 ms | emphasized decel |
+| Window move/resize: layout changes, fullscreen, drops, pointer resizing | 300 ms | emphasized decel |
 | Workspace switch: slide sideways | 700 ms | menu decel (0.1, 1, 0, 1) |
+| Window sent to another workspace: slide toward destination | 700 ms | menu decel |
 | Canvas zoom toward each scroll step | 300 ms | standard decel (0, 0, 0, 1) |
+| Canvas entry: zoom out to 60%; wallpaper depth transition | 300 ms | standard decel |
+| Canvas exit: grow and return windows to their normal layout | 300 ms | emphasized decel |
 
-A quick canvas pan keeps gliding after release. Interactive moves and resizes
-follow the pointer without delay. Both settings reload live.
+A quick canvas pan keeps gliding after release. Interactive moves follow the
+pointer directly; resizes ease toward it, with content stretched to fit the
+moving frame. Workspace slides stay within their monitor. Both settings reload live.
 
 ## Ordered Builders
 

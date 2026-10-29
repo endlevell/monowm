@@ -9,9 +9,11 @@
  */
 
 #define ANIM_OPEN_SCALE  0.8   /* size windows pop in from */
-#define ANIM_CLOSE_SCALE 0.9   /* size closing windows shrink to */
+#define ANIM_CLOSE_SCALE 0.8   /* match the opening pop's scale */
 #define ANIM_GLIDE_MS    325.0 /* pan glide velocity decay time constant */
 #define ANIM_GLIDE_MIN   0.02  /* canvas units per ms below which a glide stops */
+#define CANVAS_OVERVIEW_ZOOM 0.6
+#define CANVAS_PARALLAX_OVERSCAN 0.12
 
 /* Cubic bezier easing from (0,0) to (1,1) through (x1,y1) and (x2,y2), as in
  * CSS and Hyprland */
@@ -31,19 +33,19 @@ static const struct {
 	const Bezier *curve;
 } anim_kinds[] = {
 	[ANIM_OPEN]      = { 300, &emphasized_decel },
-	[ANIM_CLOSE]     = { 200, &emphasized_decel },
+	[ANIM_CLOSE]     = { 300, &emphasized_decel },
 	[ANIM_MOVE]      = { 300, &emphasized_decel },
 	[ANIM_WORKSPACE] = { 700, &menu_decel },
 	[ANIM_ZOOM]      = { 300, &standard_decel },
 };
 
-/* A copy of a closing window's scene nodes, faded and shrunk after the
- * window itself is gone */
+/* Keep a displayed frame while its client closes or moves to a hidden tag. */
 typedef struct {
 	struct wlr_scene_node *node;
 	int x, y, width, height;
 	float color[4]; /* rects */
 	float opacity;  /* buffers */
+	struct wlr_fbox src_box;
 } SnapshotPart;
 
 typedef struct {
@@ -52,9 +54,14 @@ typedef struct {
 	struct wl_array parts; /* SnapshotPart */
 	double cx, cy;         /* tree-local point it shrinks toward */
 	uint32_t start;
+	int animation;
+	Monitor *mon;
+	uint32_t source_tags, target_tags; /* workspace transfers */
+	int x, slide_to;
 } Snapshot;
 
 static struct wl_list snapshots;
+static int snapshot_render(Snapshot *s, uint32_t now);
 
 static uint32_t
 anim_now(void)
@@ -150,11 +157,19 @@ client_displayed_geom(Client *c, uint32_t now)
 	};
 }
 
+static double
+client_frame_scale(Client *c, uint32_t now)
+{
+	double from = c->geom_scale_from > 0 ? c->geom_scale_from : 1.0;
+	double t = anim_progress(ANIM_MOVE, c->geom_start, now);
+	return from + (1.0 - from) * t;
+}
+
 /* Lay out c's borders and surface for a w x h frame at its tree origin.
  * Outer ring sits flush with the frame's outer edge, the inner ring is inset
  * by obw, and the surface by the full bw = ibw + obw. */
 static void
-client_place(Client *c, int w, int h)
+client_place(Client *c, int w, int h, const struct wlr_box *content)
 {
 	unsigned int ib = c->ibw, ob = c->obw;
 	struct wlr_box clip;
@@ -179,10 +194,10 @@ client_place(Client *c, int w, int h)
 	wlr_scene_rect_set_size(c->outer_border[3], (int)ob, MAX(1, h - 2 * (int)ob));
 	wlr_scene_node_set_position(&c->outer_border[3]->node, MAX(0, w - (int)ob), ob);
 
-	/* Clip to the displayed frame, which lags behind c->geom while moving */
+	/* Clip in native surface coordinates before stretching the content. */
 	client_get_clip(c, &clip);
-	clip.width = w - c->bw;
-	clip.height = h - c->bw;
+	clip.width = content->width;
+	clip.height = content->height;
 	wlr_scene_subsurface_tree_set_clip(&c->scene_surface->node, &clip);
 }
 
@@ -211,7 +226,7 @@ client_render(Client *c)
 {
 	Monitor *m = c->mon;
 	uint32_t now = anim_now();
-	struct wlr_box box;
+	struct wlr_box box, content;
 	double scale = 1.0, opacity = 1.0, t, s;
 	int x, y;
 
@@ -221,11 +236,25 @@ client_render(Client *c)
 	box = client_displayed_geom(c, now);
 	if (anim_progress(ANIM_MOVE, c->geom_start, now) >= 1.0)
 		c->geom_start = 0;
+	scale = client_frame_scale(c, now);
+	/* Interpolate the frame in screen/native-canvas units while retaining
+	 * optical border thickness through a canvas mode change. */
+	box.width = MAX(1, (int)round(box.width / scale));
+	box.height = MAX(1, (int)round(box.height / scale));
 	if (canvas_active(c)) {
 		box.x = m->m.x + (int)round((c->world_x - m->m.x - m->canvas_x) * m->zoom);
 		box.y = m->m.y + (int)round((c->world_y - m->m.y - m->canvas_y) * m->zoom);
-		scale = m->zoom;
+		scale *= m->zoom;
 	}
+	client_get_geometry(c, &content);
+	if (content.width <= 0)
+		content.width = MAX(1, box.width - 2 * (int)c->bw);
+	if (content.height <= 0)
+		content.height = MAX(1, box.height - 2 * (int)c->bw);
+	c->content_scale_x = (double)MAX(1, box.width - 2 * (int)c->bw) / content.width;
+	c->content_scale_y = (double)MAX(1, box.height - 2 * (int)c->bw) / content.height;
+	c->rendered = (struct wlr_box){box.x, box.y,
+			MAX(1, (int)round(box.width * scale)), MAX(1, (int)round(box.height * scale))};
 	x = box.x;
 	y = box.y;
 
@@ -255,9 +284,10 @@ client_render(Client *c)
 
 	/* Scaling rewrites node geometry, so lay out unscaled first */
 	canvas_restore(c);
-	client_place(c, box.width, box.height);
+	client_place(c, box.width, box.height, &content);
 	wlr_scene_node_set_position(&c->scene->node, x, y);
-	if (scale != 1.0)
+	if (scale != 1.0 || c->content_scale_x != 1.0 || c->content_scale_y != 1.0
+			|| c->slide_start)
 		canvas_apply(c, scale);
 	client_set_opacity(c, opacity);
 }
@@ -268,6 +298,21 @@ anim_open(Client *c)
 {
 	c->pop_start = anim_start();
 	client_render(c);
+}
+
+static void
+anim_canvas_leave(Client *c)
+{
+	struct wlr_box from = c->rendered;
+	double scale = c->mon->zoom * client_frame_scale(c, anim_now());
+	int animate = c->incanvas && !c->isfullscreen && !wlr_box_empty(&from);
+
+	canvas_leave(c);
+	if (animate && (c->geom_start = anim_start())) {
+		c->geom_from = from;
+		c->geom_scale_from = scale;
+		client_render(c);
+	}
 }
 
 /* Slide m's windows when its view switches from tags old to new: windows
@@ -310,17 +355,36 @@ zoom_apply(Monitor *m, double zoom)
 
 /* Zoom m's canvas to zoom around the cursor */
 static void
-anim_zoom(Monitor *m, double zoom)
+anim_zoom_at(Monitor *m, double zoom, double x, double y)
 {
 	m->pan_glide = 0;
-	m->zoom_ax = cursor->x - m->m.x;
-	m->zoom_ay = cursor->y - m->m.y;
+	m->zoom_ax = x - m->m.x;
+	m->zoom_ay = y - m->m.y;
 	m->zoom_wx = m->canvas_x + m->zoom_ax / m->zoom;
 	m->zoom_wy = m->canvas_y + m->zoom_ay / m->zoom;
 	m->zoom_from = m->zoom;
 	m->zoom_to = zoom;
 	if (!(m->zoom_start = anim_start()))
 		zoom_apply(m, zoom);
+}
+
+static void
+anim_zoom(Monitor *m, double zoom)
+{
+	anim_zoom_at(m, zoom, cursor->x, cursor->y);
+}
+
+static void
+anim_backdrop(Monitor *m, int canvas)
+{
+	double target = canvas ? 1.0 : 0.0;
+	if (m->backdrop_to == target && (m->backdrop_start || m->backdrop_mix == target))
+		return;
+	m->backdrop_from = m->backdrop_mix;
+	m->backdrop_to = target;
+	if (!(m->backdrop_start = anim_start()))
+		m->backdrop_mix = target;
+	backdrop_update(m);
 }
 
 /* A pan is starting: settle any zoom or glide so they don't fight it */
@@ -418,6 +482,7 @@ snapshot_copy(Snapshot *s, struct wlr_scene_tree *src, int ox, int oy)
 			struct wlr_scene_rect *rect = wlr_scene_rect_from_node(node), *copy;
 			if (!(copy = wlr_scene_rect_create(s->tree, rect->width, rect->height, rect->color)))
 				continue;
+			copy->accepts_input = false;
 			part.node = &copy->node;
 			part.width = rect->width;
 			part.height = rect->height;
@@ -441,6 +506,10 @@ snapshot_copy(Snapshot *s, struct wlr_scene_tree *src, int ox, int oy)
 			part.width = buffer->dst_width > 0 ? buffer->dst_width : bw;
 			part.height = buffer->dst_height > 0 ? buffer->dst_height : bh;
 			part.opacity = buffer->opacity;
+			part.src_box = buffer->src_box;
+			/* Preserve the displayed frame immediately, before the first tick. */
+			wlr_scene_buffer_set_dest_size(copy, part.width, part.height);
+			wlr_scene_buffer_set_opacity(copy, part.opacity);
 		} else {
 			continue;
 		}
@@ -453,20 +522,19 @@ snapshot_copy(Snapshot *s, struct wlr_scene_tree *src, int ox, int oy)
 	}
 }
 
-/* Keep c's last frame on screen to fade out after c unmaps */
-static void
-anim_close(Client *c)
+static Snapshot *
+snapshot_create(Client *c)
 {
 	Snapshot *s;
 	SnapshotPart *p;
 	int w = 0, h = 0;
 
 	if (!c->scene->node.enabled || c->leaving || !anim_enabled())
-		return;
+		return NULL;
 	s = ecalloc(1, sizeof(*s));
 	if (!(s->tree = wlr_scene_tree_create(c->scene->node.parent))) {
 		free(s);
-		return;
+		return NULL;
 	}
 	wl_array_init(&s->parts);
 	wlr_scene_node_set_position(&s->tree->node, c->scene->node.x, c->scene->node.y);
@@ -477,8 +545,39 @@ anim_close(Client *c)
 	}
 	s->cx = w / 2.0;
 	s->cy = h / 2.0;
+	s->animation = ANIM_CLOSE;
+	s->mon = c->mon;
+	s->x = c->scene->node.x;
 	s->start = anim_start();
 	wl_list_insert(&snapshots, &s->link);
+	return s;
+}
+
+/* Keep c's last frame on screen to fade out after c unmaps. */
+static void
+anim_close(Client *c)
+{
+	snapshot_create(c);
+}
+
+/* Tags change immediately; their outgoing picture slides independently of
+ * the client's next layout, canvas state, focus, and application redraws. */
+static void
+anim_send(Client *c, uint32_t newtags)
+{
+	Monitor *m = c->mon;
+	Snapshot *s;
+
+	if (!VISIBLEON(c, m) || (newtags & m->tagset[m->seltags]))
+		return;
+	if (!(s = snapshot_create(c)))
+		return;
+	s->animation = ANIM_WORKSPACE;
+	s->source_tags = c->tags & m->tagset[m->seltags];
+	s->target_tags = newtags;
+	s->slide_to = __builtin_ctz(newtags) > __builtin_ctz(s->source_tags)
+			? m->m.width : -m->m.width;
+	snapshot_render(s, s->start);
 }
 
 static void
@@ -494,15 +593,28 @@ snapshot_destroy(Snapshot *s)
 static int
 snapshot_render(Snapshot *s, uint32_t now)
 {
-	double t = anim_progress(ANIM_CLOSE, s->start, now);
-	double k = 1.0 - (1.0 - ANIM_CLOSE_SCALE) * t;
-	float a = (float)(1.0 - t), color[4];
+	int sending = s->animation == ANIM_WORKSPACE;
+	double t = anim_progress(s->animation, s->start, now);
+	double k = sending ? 1.0 : 1.0 - (1.0 - ANIM_CLOSE_SCALE) * t;
+	float a = sending ? 1.0f : (float)(1.0 - t), color[4];
 	SnapshotPart *p;
 
+	/* A transfer belongs to its source view. Drop the picture when that view
+	 * is left, or its destination becomes visible, to avoid duplicate windows. */
+	if (sending && (!(s->mon->tagset[s->mon->seltags] & s->source_tags)
+			|| (s->mon->tagset[s->mon->seltags] & s->target_tags)))
+		return 1;
 	if (t >= 1.0)
 		return 1;
+	if (sending) {
+		/* Focusing a remaining tile can raise it while it fills the gap. */
+		wlr_scene_node_raise_to_top(&s->tree->node);
+		wlr_scene_node_set_position(&s->tree->node,
+				s->x + (int)round(s->slide_to * t), s->tree->node.y);
+	}
 	wl_array_for_each(p, &s->parts) {
-		int w = MAX(1, (int)round(p->width * k)), h = MAX(1, (int)round(p->height * k));
+		int w = MAX(0, (int)round(p->width * k)), h = MAX(0, (int)round(p->height * k));
+		wlr_scene_node_set_enabled(p->node, true);
 		wlr_scene_node_set_position(p->node, (int)round(s->cx + (p->x - s->cx) * k),
 				(int)round(s->cy + (p->y - s->cy) * k));
 		if (p->node->type == WLR_SCENE_NODE_RECT) {
@@ -511,9 +623,14 @@ snapshot_render(Snapshot *s, uint32_t now)
 			wlr_scene_rect_set_size(wlr_scene_rect_from_node(p->node), w, h);
 			wlr_scene_rect_set_color(wlr_scene_rect_from_node(p->node), color);
 		} else {
+			wlr_scene_buffer_set_source_box(wlr_scene_buffer_from_node(p->node), &p->src_box);
 			wlr_scene_buffer_set_dest_size(wlr_scene_buffer_from_node(p->node), w, h);
 			wlr_scene_buffer_set_opacity(wlr_scene_buffer_from_node(p->node), p->opacity * a);
 		}
+		if (sending)
+			scene_clip_node(p->node, p->src_box, (struct wlr_box){
+					s->tree->node.x + p->node->x, s->tree->node.y + p->node->y, w, h},
+					&s->mon->m);
 	}
 	return 0;
 }
@@ -530,6 +647,14 @@ anim_tick(void)
 	double t;
 
 	wl_list_for_each(m, &mons, link) {
+		if (m->backdrop_start) {
+			t = anim_progress(ANIM_ZOOM, m->backdrop_start, now);
+			m->backdrop_mix = m->backdrop_from + (m->backdrop_to - m->backdrop_from) * t;
+			if (t >= 1.0)
+				m->backdrop_start = 0;
+			active |= m->backdrop_start != 0;
+			backdrop_update(m);
+		}
 		if (m->zoom_start) {
 			t = anim_progress(ANIM_ZOOM, m->zoom_start, now);
 			if (t >= 1.0)
@@ -561,4 +686,13 @@ anim_cleanup(void)
 	Snapshot *s, *tmp;
 	wl_list_for_each_safe(s, tmp, &snapshots, link)
 		snapshot_destroy(s);
+}
+
+static void
+anim_cleanupmon(Monitor *m)
+{
+	Snapshot *s, *tmp;
+	wl_list_for_each_safe(s, tmp, &snapshots, link)
+		if (s->mon == m)
+			snapshot_destroy(s);
 }

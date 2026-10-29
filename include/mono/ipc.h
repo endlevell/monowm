@@ -181,11 +181,7 @@ ipc_output_handle_set_client_tags(struct wl_client *client,
 	if (!sel) return;
 
 	newtags = (sel->tags & and_tags) ^ xor_tags;
-	if (!newtags) return;
-	sel->tags = newtags;
-	focusclient(focustop(m), 1);
-	arrange(m);
-	printstatus();
+	settags(sel, newtags);
 }
 
 static void

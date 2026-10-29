@@ -19,6 +19,15 @@ SMSG_BUILD = tools/monomsg/build
 
 all: $(MONO_BUILD)/mono $(SMSG_BUILD)/monomsg
 
+check: $(MONO_BUILD)/test-animation
+	$(MONO_BUILD)/test-animation
+
+$(MONO_BUILD)/test-animation: tests/animation.c $(MONO_BUILD)/mono
+	$(CC) $(DWLCFLAGS) -o $@ tests/animation.c $(MONO_BUILD)/util.o \
+		$(MONO_BUILD)/parser.o $(MONO_BUILD)/workspace.o \
+		$(MONO_BUILD)/dwl-ipc-unstable-v2-protocol.o \
+		$(MONO_BUILD)/ext-workspace-v1-protocol.o $(LDFLAGS) $(LDLIBS) $(SMSG_LDLIBS)
+
 $(MONO_BUILD) $(SMSG_BUILD) protocols/generated:
 	mkdir -p $@
 

@@ -29,11 +29,11 @@ zoom eases toward each step and a pan released mid-drag keeps gliding briefly.
 ## Using Canvas
 
 1. Switch to desired tag.
-2. Run `togglecanvas` binding.
+2. Run `togglecanvas` binding to ease into a 60% overview.
 3. Open or move windows around freely.
 4. Hold middle button and drag to pan viewport.
 5. Hold `logo` and scroll to zoom.
-6. Run `togglecanvas` again to return windows to dwindle layout.
+6. Run `togglecanvas` again to smoothly grow windows back into their normal layout.
 
 Canvas windows are not clamped to monitor boundaries. A window can remain far
 outside current viewport until you pan back to it.
@@ -58,14 +58,26 @@ When a visible tag enters canvas mode:
 - tiled windows become floating
 - current window positions become world positions
 - current sizes become world sizes
+- the view smoothly zooms out to 60%, centered on the monitor's usable area
 - new windows appear near pointer position
 - normal monitor boundary clamping is disabled
 
 ## Leaving Canvas
 
-When canvas mode is disabled, affected windows return to tiled state and are
-inserted into dwindle layout. Their stored world positions remain available if
-canvas is enabled again later.
+When canvas mode is disabled, windows smoothly grow and move into their normal
+layout. Previously tiled windows return to dwindle; previously floating windows
+stay floating. A later entry starts from the windows' current layout.
+
+## Wallpaper Parallax
+
+Canvas navigation moves the wallpaper more slowly than the windows, adding a
+sense of depth. The wallpaper subtly zooms in to provide room for movement;
+movement is bounded so the image always fills its monitor. Leaving canvas
+smoothly restores its normal appearance.
+
+This works with non-interactive background wallpapers such as `swaybg`. Panels,
+launchers, and interactive desktop surfaces keep their normal appearance and
+input behavior. Each monitor's wallpaper follows its own canvas.
 
 ## Per-Tag and Per-Monitor State
 

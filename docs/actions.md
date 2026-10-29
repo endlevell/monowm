@@ -192,6 +192,9 @@ mono.action("viewshift", "-1")
 
 Move focused window to next or previous tag.
 
+Sending a window to a hidden tag slides it toward the destination while staying
+on the current workspace. This also applies to `tag` and `toggletag`.
+
 ```lua
 mono.action("tagshift", "1")
 mono.action("tagshift", "-1")
