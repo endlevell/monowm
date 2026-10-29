@@ -908,6 +908,12 @@ cleanup(void)
 	/* Destroy after the wayland display (when the monitors are already destroyed)
 	   to avoid destroying them with an invalid scene output. */
 	wlr_scene_node_destroy(&scene->tree.node);
+
+	/* Last, since key bindings call into Lua until input is torn down */
+	if (g_L) {
+		lua_close(g_L);
+		g_L = NULL;
+	}
 }
 
 void
