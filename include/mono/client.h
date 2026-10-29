@@ -305,10 +305,21 @@ client_send_close(Client *c)
 static inline void
 client_set_border_color(Client *c, const float inner[static 4], const float outer[static 4])
 {
+    float in[4], out[4];
     int i;
+    /* Remember the colors so opacity changes can reapply them */
+    if (inner != c->inner_color)
+	memcpy(c->inner_color, inner, sizeof(c->inner_color));
+    if (outer != c->outer_color)
+	memcpy(c->outer_color, outer, sizeof(c->outer_color));
+    /* Colors are premultiplied, so opacity scales every channel */
     for (i = 0; i < 4; i++) {
-	wlr_scene_rect_set_color(c->inner_border[i], inner);
-	wlr_scene_rect_set_color(c->outer_border[i], outer);
+	in[i] = c->inner_color[i] * (float)c->opacity;
+	out[i] = c->outer_color[i] * (float)c->opacity;
+    }
+    for (i = 0; i < 4; i++) {
+	wlr_scene_rect_set_color(c->inner_border[i], in);
+	wlr_scene_rect_set_color(c->outer_border[i], out);
     }
 }
 

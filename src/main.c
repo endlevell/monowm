@@ -44,7 +44,8 @@
 #include <wlr/types/wlr_primary_selection.h>
 #include <wlr/types/wlr_primary_selection_v1.h>
 #include <wlr/types/wlr_relative_pointer_v1.h>
-#include <wlr/types/wlr_scene.h>
+#include <scenefx/render/fx_renderer/fx_renderer.h>
+#include <scenefx/types/wlr_scene.h>
 #include <wlr/types/wlr_screencopy_v1.h>
 #include <wlr/types/wlr_seat.h>
 #include <wlr/types/wlr_server_decoration.h>
@@ -130,6 +131,17 @@ typedef struct {
 	unsigned int canvas_generation;
 	struct wl_list canvas_nodes;
 	struct wl_event_source *canvas_refresh;
+	/* Animation state, see animation.h. geom is always the target; these
+	 * describe what is displayed on the way there. */
+	int placed;                  /* initial layout done; later moves animate */
+	uint32_t geom_start;         /* displayed box moves from geom_from to geom */
+	struct wlr_box geom_from;
+	uint32_t pop_start;          /* opening: grow and fade in */
+	uint32_t slide_start;        /* workspace switch: x offset slide_from -> slide_to */
+	int slide_from, slide_to;
+	int leaving;                 /* shown until its slide ends, though not VISIBLEON */
+	double opacity;              /* applied to buffers and border colors */
+	float inner_color[4], outer_color[4]; /* border colors before opacity */
 	struct wlr_scene_tree *scene;
 	struct wlr_scene_rect *inner_border[4]; /* inner top, bottom, left, right */
 	struct wlr_scene_rect *outer_border[4]; /* outer top, bottom, left, right */
@@ -249,6 +261,16 @@ struct Monitor {
   double canvas_x, canvas_y; /* current pan offset for the active tag */
   double pan_start_cx, pan_start_cy;   /* cursor position when pan began */
   double pan_start_ox, pan_start_oy;   /* canvas_x/y when pan began */
+	/* Smooth zoom keeps world point (zoom_wx, zoom_wy) under the monitor
+	 * offset (zoom_ax, zoom_ay) while zoom goes from zoom_from to zoom_to */
+	uint32_t zoom_start;
+	double zoom_from, zoom_to;
+	double zoom_ax, zoom_ay, zoom_wx, zoom_wy;
+	/* Pan velocity in canvas units per ms; pan_glide keeps it moving after release */
+	double pan_vx, pan_vy;
+	double pan_px, pan_py; /* canvas position at pan_last */
+	uint32_t pan_last;
+	int pan_glide;
 	struct wl_list link;
 	struct wlr_output *wlr_output;
 	struct wlr_scene_output *scene_output;
@@ -328,6 +350,7 @@ static void canvas_surface_commit(struct wl_listener *listener, void *data);
 static void canvas_refresh_idle(void *data);
 static void canvas_restore(Client *c);
 static void canvas_leave(Client *c);
+static void client_render(Client *c);
 static bool canvas_buffer_accepts_input(struct wlr_scene_buffer *buffer,
 		double *sx, double *sy);
 static void canvas_cancel_grab(Client *c);
@@ -584,6 +607,7 @@ static const char *custom_cfg_path;
 #include "mono/client.h"
 #include "mono/ipc.h"
 #include "mono/ext.h"
+#include "mono/animation.h"
 
 /* function implementations */
 void
@@ -646,7 +670,7 @@ arrange(Monitor *m)
 
 	wl_list_for_each(c, &clients, link) {
 		if (c->mon == m) {
-			wlr_scene_node_set_enabled(&c->scene->node, VISIBLEON(c, m));
+			wlr_scene_node_set_enabled(&c->scene->node, VISIBLEON(c, m) || c->leaving);
       client_set_suspended(c, !(VISIBLEON(c, m)));
 		}
 	}
@@ -757,18 +781,10 @@ axisnotify(struct wl_listener *listener, void *data)
 
 	if (CLEANMASK(mods) == WLR_MODIFIER_LOGO && selmon
 			&& (selmon->canvas_tags & selmon->tagset[selmon->seltags])) {
-		double old_zoom = selmon->zoom;
-		double world_x = selmon->canvas_x
-				+ (cursor->x - selmon->m.x) / old_zoom;
-		double world_y = selmon->canvas_y
-				+ (cursor->y - selmon->m.y) / old_zoom;
-		selmon->zoom = MIN(1.0, MAX(0.2,
-				old_zoom + (event->delta < 0 ? 0.1 : -0.1)));
-		selmon->canvas_x = world_x
-				- (cursor->x - selmon->m.x) / selmon->zoom;
-		selmon->canvas_y = world_y
-				- (cursor->y - selmon->m.y) / selmon->zoom;
-		canvas_layout(selmon);
+		/* Step from the zoom being animated to, so fast scrolling adds up */
+		double from = selmon->zoom_start ? selmon->zoom_to : selmon->zoom;
+		anim_zoom(selmon, MIN(1.0, MAX(0.2,
+				from + (event->delta < 0 ? 0.1 : -0.1))));
 		return;
 	}
 
@@ -827,6 +843,7 @@ buttonpress(struct wl_listener *listener, void *data)
 			wlr_cursor_set_xcursor(cursor, cursor_mgr, "default");
 			if (cursor_mode == CurCanvasPan) {
 				cursor_mode = CurNormal;
+				pan_release(panmon);
 				panmon = NULL;
 				return;
 			}
@@ -918,6 +935,8 @@ cleanup(void)
 	wl_display_destroy(dpy);
 	/* Destroy after the wayland display (when the monitors are already destroyed)
 	   to avoid destroying them with an invalid scene output. */
+	/* Unmapping during teardown leaves closing snapshots behind */
+	anim_cleanup();
 	wlr_scene_node_destroy(&scene->tree.node);
 
 	/* Last, since key bindings call into Lua until input is torn down */
@@ -1860,7 +1879,7 @@ gpureset(struct wl_listener *listener, void *data)
 	struct wlr_renderer *old_drw = drw;
 	struct wlr_allocator *old_alloc = alloc;
 	struct Monitor *m;
-	if (!(drw = wlr_renderer_autocreate(backend)))
+	if (!(drw = fx_renderer_create(backend)))
 		die("couldn't recreate renderer");
 
 	if (!(alloc = wlr_allocator_autocreate(backend, drw)))
@@ -2226,6 +2245,7 @@ mapnotify(struct wl_listener *listener, void *data)
 	c->scene = client_surface(c)->data = wlr_scene_tree_create(layers[LyrTile]);
 	wl_list_init(&c->canvas_nodes);
 	c->visual_scale = 1.0;
+	c->opacity = 1.0;
 	LISTEN(&client_surface(c)->events.new_subsurface, &c->new_subsurface,
 			canvas_new_subsurface);
 	/* Enabled later by a call to arrange() */
@@ -2259,6 +2279,9 @@ mapnotify(struct wl_listener *listener, void *data)
 				c->isurgent ? cfg.appearance.outer_urgent_color : cfg.appearance.outer_border_color);
 		c->outer_border[i]->node.data = c;
 	}
+	client_set_border_color(c,
+			c->isurgent ? cfg.appearance.inner_urgent_color : cfg.appearance.inner_border_color,
+			c->isurgent ? cfg.appearance.outer_urgent_color : cfg.appearance.outer_border_color);
 
 	/* Initialize client geometry with room for border */
 	client_set_tiled(c, WLR_EDGE_TOP | WLR_EDGE_BOTTOM | WLR_EDGE_LEFT | WLR_EDGE_RIGHT);
@@ -2291,6 +2314,9 @@ mapnotify(struct wl_listener *listener, void *data)
 		canvas_layout(c->mon);
 	}
 
+	/* Moves from here on animate; the initial placement does not */
+	c->placed = 1;
+	anim_open(c);
 	printstatus();
 
 unset_fullscreen:
@@ -2486,6 +2512,7 @@ motionnotify(uint32_t time, struct wlr_input_device *device, double dx, double d
 				- (cursor->x - panmon->pan_start_cx) / panmon->zoom;
 		panmon->canvas_y = panmon->pan_start_oy
 				- (cursor->y - panmon->pan_start_cy) / panmon->zoom;
+		pan_track(panmon);
 		canvas_layout(panmon);
 		return;
 	}
@@ -2523,6 +2550,7 @@ canvaspan(const Arg *arg)
 		return;
 	cursor_mode = CurCanvasPan;
 	panmon = selmon;
+	pan_begin(panmon);
 	panmon->pan_start_cx = cursor->x;
 	panmon->pan_start_cy = cursor->y;
 	panmon->pan_start_ox = panmon->canvas_x;
@@ -2766,6 +2794,9 @@ rendermon(struct wl_listener *listener, void *data)
 	struct wlr_output_state pending = {0};
 	struct timespec now;
 
+	if (anim_tick())
+		anim_schedule();
+
 	/* Render if no XDG clients have an outstanding resize and are visible on
 	 * this monitor. */
 	wl_list_for_each(c, &clients, link) {
@@ -2814,53 +2845,29 @@ requestmonstate(struct wl_listener *listener, void *data)
 void
 resize(Client *c, struct wlr_box geo, int interact)
 {
-	struct wlr_box *bbox;
-	struct wlr_box clip;
+	struct wlr_box *bbox, from;
 
 	if (!c->mon || !client_surface(c)->mapped)
 		return;
 
 	bbox = interact ? &sgeom : &c->mon->w;
+	from = client_displayed_geom(c, anim_now());
 
 	client_set_bounds(c, geo.width, geo.height);
 	c->geom = geo;
 	applybounds(c, bbox);
 
-	/* Update scene-graph, including borders.
-	 * Outer ring sits flush with the client's outer edge (0,0 .. w,h).
-	 * Inner ring is inset by obw from the outer ring.
-	 * The surface itself is inset by the full bw = ibw + obw. */
-	{
-		unsigned int ib = c->ibw, ob = c->obw;
-		int w = c->geom.width, h = c->geom.height;
-
-		wlr_scene_node_set_position(&c->scene->node, c->geom.x, c->geom.y);
-		wlr_scene_node_set_position(&c->scene_surface->node, c->bw, c->bw);
-
-		wlr_scene_rect_set_size(c->inner_border[0], MAX(1, w - 2 * (int)ob), (int)ib);
-		wlr_scene_node_set_position(&c->inner_border[0]->node, ob, ob);
-		wlr_scene_rect_set_size(c->inner_border[1], MAX(1, w - 2 * (int)ob), (int)ib);
-		wlr_scene_node_set_position(&c->inner_border[1]->node, ob, MAX(0, h - (int)ob - (int)ib));
-		wlr_scene_rect_set_size(c->inner_border[2], (int)ib, MAX(1, h - 2 * (int)ob));
-		wlr_scene_node_set_position(&c->inner_border[2]->node, ob, ob);
-		wlr_scene_rect_set_size(c->inner_border[3], (int)ib, MAX(1, h - 2 * (int)ob));
-		wlr_scene_node_set_position(&c->inner_border[3]->node, MAX(0, w - (int)ob - (int)ib), ob);
-
-		wlr_scene_rect_set_size(c->outer_border[0], MAX(1, w), (int)ob);
-		wlr_scene_node_set_position(&c->outer_border[0]->node, 0, 0);
-		wlr_scene_rect_set_size(c->outer_border[1], MAX(1, w), (int)ob);
-		wlr_scene_node_set_position(&c->outer_border[1]->node, 0, MAX(0, h - (int)ob));
-		wlr_scene_rect_set_size(c->outer_border[2], (int)ob, MAX(1, h - 2 * (int)ob));
-		wlr_scene_node_set_position(&c->outer_border[2]->node, 0, ob);
-		wlr_scene_rect_set_size(c->outer_border[3], (int)ob, MAX(1, h - 2 * (int)ob));
-		wlr_scene_node_set_position(&c->outer_border[3]->node, MAX(0, w - (int)ob), ob);
-	}
+	/* Layout moves glide from where the window is shown now; interactive
+	 * moves follow the pointer directly. Canvas windows place themselves. */
+	if (interact || !c->placed || canvas_active(c))
+		c->geom_start = 0;
+	else if (!wlr_box_equal(&from, &c->geom) && (c->geom_start = anim_start()))
+		c->geom_from = from;
 
 	/* this is a no-op if size hasn't changed */
 	c->resize = client_set_size(c, c->geom.width - 2 * c->bw,
 			c->geom.height - 2 * c->bw);
-	client_get_clip(c, &clip);
-	wlr_scene_subsurface_tree_set_clip(&c->scene_surface->node, &clip);
+	client_render(c);
 }
 
 void
@@ -3029,6 +3036,8 @@ setmon(Client *c, Monitor *m, uint32_t newtags)
 	if (oldmon == m)
 		return;
 	canvas_leave(c);
+	c->slide_start = 0;
+	c->leaving = 0;
 	c->mon = m;
 	c->prev = c->geom;
 
@@ -3233,7 +3242,7 @@ setup(void)
 	 * can also specify a renderer using the WLR_RENDERER env var.
 	 * The renderer is responsible for defining the various pixel formats it
 	 * supports for shared memory, this configures that for clients. */
-	if (!(drw = wlr_renderer_autocreate(backend)))
+	if (!(drw = fx_renderer_create(backend)))
 		die("couldn't create renderer");
 	wl_signal_add(&drw->events.lost, &gpu_reset);
 
@@ -3300,6 +3309,7 @@ setup(void)
 	/* Configure a listener to be notified when new outputs are available on the
 	 * backend. */
 	wl_list_init(&mons);
+	wl_list_init(&snapshots);
 	wl_list_init(&pointers);
 	wl_signal_add(&backend->events.new_output, &new_output);
 
@@ -3830,10 +3840,7 @@ canvas_transform_tree(Client *c, struct wlr_scene_tree *tree, double scale)
 				state->filter_mode = buffer->filter_mode;
 				state->accepts_input = buffer->point_accepts_input;
 				if (surface) {
-					state->width = buffer->dst_width > 0
-							? buffer->dst_width : surface->surface->current.width;
-					state->height = buffer->dst_height > 0
-							? buffer->dst_height : surface->surface->current.height;
+					/* Size comes live from the surface, see below */
 					state->surface_commit.notify = canvas_surface_commit;
 					wl_signal_add(&surface->surface->events.commit,
 							&state->surface_commit);
@@ -3853,13 +3860,19 @@ canvas_transform_tree(Client *c, struct wlr_scene_tree *tree, double scale)
 		wlr_scene_node_set_position(node, (int)round(state->x * scale),
 				(int)round(state->y * scale));
 
-		if (node->type == WLR_SCENE_NODE_BUFFER && state->width > 0 && state->height > 0) {
+		if (node->type == WLR_SCENE_NODE_BUFFER) {
 			struct wlr_scene_buffer *buffer = wlr_scene_buffer_from_node(node);
-			buffer->point_accepts_input = canvas_buffer_accepts_input;
-			wlr_scene_buffer_set_dest_size(buffer,
-					MAX(1, (int)round(state->width * scale)),
-					MAX(1, (int)round(state->height * scale)));
-			wlr_scene_buffer_set_filter_mode(buffer, WLR_SCALE_FILTER_BILINEAR);
+			struct wlr_scene_surface *surface = wlr_scene_surface_try_from_buffer(buffer);
+			/* A surface's natural size is its current state. A recorded
+			 * size goes stale when it commits a new size while scaled. */
+			int w = surface ? surface->surface->current.width : state->width;
+			int h = surface ? surface->surface->current.height : state->height;
+			if (w > 0 && h > 0) {
+				buffer->point_accepts_input = canvas_buffer_accepts_input;
+				wlr_scene_buffer_set_dest_size(buffer,
+						MAX(1, (int)round(w * scale)), MAX(1, (int)round(h * scale)));
+				wlr_scene_buffer_set_filter_mode(buffer, WLR_SCALE_FILTER_BILINEAR);
+			}
 		} else if (node->type == WLR_SCENE_NODE_RECT) {
 			wlr_scene_rect_set_size(wlr_scene_rect_from_node(node),
 					MAX(0, (int)round(state->width * scale)),
@@ -3898,7 +3911,12 @@ canvas_restore_tree(Client *c, struct wlr_scene_tree *tree)
 			wlr_scene_node_set_position(node, state->x, state->y);
 			if (node->type == WLR_SCENE_NODE_BUFFER) {
 				struct wlr_scene_buffer *buffer = wlr_scene_buffer_from_node(node);
-				wlr_scene_buffer_set_dest_size(buffer, state->dst_width, state->dst_height);
+				struct wlr_scene_surface *surface = wlr_scene_surface_try_from_buffer(buffer);
+				if (surface)
+					wlr_scene_buffer_set_dest_size(buffer, surface->surface->current.width,
+							surface->surface->current.height);
+				else
+					wlr_scene_buffer_set_dest_size(buffer, state->dst_width, state->dst_height);
 				wlr_scene_buffer_set_filter_mode(buffer, state->filter_mode);
 				buffer->point_accepts_input = state->accepts_input;
 			} else if (node->type == WLR_SCENE_NODE_RECT) {
@@ -3992,7 +4010,7 @@ static void
 canvas_new_subsurface(struct wl_listener *listener, void *data)
 {
 	Client *c = wl_container_of(listener, c, new_subsurface);
-	if (canvas_active(c) && !c->canvas_refresh)
+	if (!wl_list_empty(&c->canvas_nodes) && !c->canvas_refresh)
 		c->canvas_refresh = wl_event_loop_add_idle(event_loop,
 				canvas_refresh_idle, c);
 }
@@ -4002,20 +4020,11 @@ canvas_surface_commit(struct wl_listener *listener, void *data)
 {
 	CanvasNodeState *state = wl_container_of(listener, state, surface_commit);
 	Client *c = state->client;
-	struct wlr_scene_buffer *buffer = wlr_scene_buffer_from_node(state->node);
 
-	if (!canvas_active(c))
-		return;
-
+	/* The commit reset the buffer to its natural size; scale it again */
 	state->x = state->node->x;
 	state->y = state->node->y;
-	state->dst_width = buffer->dst_width;
-	state->dst_height = buffer->dst_height;
-	state->width = buffer->dst_width > 0 ? buffer->dst_width
-			: (buffer->buffer ? buffer->buffer->width : state->width);
-	state->height = buffer->dst_height > 0 ? buffer->dst_height
-			: (buffer->buffer ? buffer->buffer->height : state->height);
-	canvas_apply(c, c->mon->zoom);
+	canvas_apply(c, c->visual_scale);
 }
 
 static void
@@ -4023,8 +4032,7 @@ canvas_refresh_idle(void *data)
 {
 	Client *c = data;
 	c->canvas_refresh = NULL;
-	if (canvas_active(c))
-		canvas_layout(c->mon);
+	client_render(c);
 }
 
 /* layout entry point */
@@ -4057,10 +4065,7 @@ canvas_layout(Monitor *m)
 		c->geom.y = (int)round(c->world_y);
 		c->geom.width = MAX(1, (int)round(c->world_width));
 		c->geom.height = MAX(1, (int)round(c->world_height));
-		wlr_scene_node_set_position(&c->scene->node,
-				m->m.x + (int)round((c->world_x - m->m.x - m->canvas_x) * m->zoom),
-				m->m.y + (int)round((c->world_y - m->m.y - m->canvas_y) * m->zoom));
-		canvas_apply(c, m->zoom);
+		client_render(c);
 	}
 }
 
@@ -4352,6 +4357,9 @@ unmapnotify(struct wl_listener *listener, void *data)
 {
 	/* Called when the surface is unmapped, and should no longer be shown. */
 	Client *c = wl_container_of(listener, c, unmap);
+
+	if (!client_is_unmanaged(c))
+		anim_close(c);
 	if (c == grabc) {
 		if (cursor_mode == CurTileDrag) {
 			preselect_target = NULL;
@@ -4509,11 +4517,15 @@ urgent(struct wl_listener *listener, void *data)
 void
 view(const Arg *arg)
 {
+	uint32_t old;
+
 	if (!selmon || (arg->ui & TAGMASK) == selmon->tagset[selmon->seltags])
 		return;
+	old = selmon->tagset[selmon->seltags];
 	selmon->seltags ^= 1; /* toggle sel tagset */
 	if (arg->ui & TAGMASK)
 		selmon->tagset[selmon->seltags] = arg->ui & TAGMASK;
+	anim_view(selmon, old, selmon->tagset[selmon->seltags]);
 	focusclient(focustop(selmon), 1);
 	arrange(selmon);
 	printstatus();
@@ -4658,15 +4670,21 @@ xytonode(double x, double y, struct wlr_surface **psurface,
 		if (!(node = wlr_scene_node_at(&layers[layer]->node, x, y, nx, ny)))
 			continue;
 
-		if (node->type == WLR_SCENE_NODE_BUFFER)
-			surface = wlr_scene_surface_try_from_buffer(
-					wlr_scene_buffer_from_node(node))->surface;
+		if (node->type == WLR_SCENE_NODE_BUFFER) {
+			/* Not every buffer is a surface, e.g. closing snapshots */
+			struct wlr_scene_surface *scene_surface = wlr_scene_surface_try_from_buffer(
+					wlr_scene_buffer_from_node(node));
+			surface = scene_surface ? scene_surface->surface : NULL;
+		}
 		/* Walk the tree to find a node that knows the client */
 		for (pnode = node; pnode && !c; pnode = &pnode->parent->node)
 			c = pnode->data;
 		if (c && c->type == LayerShell) {
 			c = NULL;
 			l = pnode->data;
+		} else if (c && c->leaving) {
+			c = NULL;
+			surface = NULL;
 		}
 	}
 

@@ -15,6 +15,8 @@ tiled and spatial workspaces can coexist on the same monitor.
 - Cursor-aware dwindle tiling and directional focus
 - Drag-to-rearrange tiles with edge placement preview
 - Per-tag infinite canvas mode with pan and zoom
+- Animations through scenefx: window open/close, layout moves, workspace
+  slides, smooth canvas zoom and pan glide
 - Floating, fullscreen, gaps, smart gaps, and double borders
 - Lua 5.4 configuration with callback-driven key bindings
 - Live config reload with previous config retained after Lua errors
@@ -26,7 +28,7 @@ tiled and spatial workspaces can coexist on the same monitor.
 
 ## Quick Start
 
-Required libraries include wlroots 0.20, Wayland, libinput, xkbcommon, Lua 5.4,
+Required libraries include wlroots 0.20, scenefx 0.5, Wayland, libinput, xkbcommon, Lua 5.4,
 and XCB when XWayland is enabled. Full package details live in
 [Getting Started](docs/getting-started.md).
 

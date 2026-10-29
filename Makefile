@@ -30,7 +30,7 @@ $(MONO_BUILD)/mono: $(MONO_BUILD)/main.o $(MONO_BUILD)/util.o \
 
 $(MONO_BUILD)/main.o: src/main.c include/mono/client.h config/config.h include/mono/ipc.h \
 	protocols/generated/dwl-ipc-unstable-v2-protocol.h \
-	include/mono/ext.h include/mono/workspace.h protocols/generated/ext-workspace-v1-protocol.h \
+	include/mono/ext.h include/mono/animation.h include/mono/workspace.h protocols/generated/ext-workspace-v1-protocol.h \
 	protocols/generated/cursor-shape-v1-protocol.h protocols/generated/pointer-constraints-unstable-v1-protocol.h \
 	protocols/generated/wlr-layer-shell-unstable-v1-protocol.h \
 	protocols/generated/wlr-output-power-management-unstable-v1-protocol.h protocols/generated/xdg-shell-protocol.h \

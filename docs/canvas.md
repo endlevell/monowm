@@ -23,7 +23,8 @@ buttons = {
 
 Zoom is built in: hold `logo` and use pointer scroll wheel while canvas tag is
 active. Zoom range is `0.2` through `1.0`; `1.0` is native window size. World point under pointer stays
-anchored while zoom changes.
+anchored while zoom changes. With [animations](configuration.md#animations) on,
+zoom eases toward each step and a pan released mid-drag keeps gliding briefly.
 
 ## Using Canvas
 

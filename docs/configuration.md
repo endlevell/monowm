@@ -48,7 +48,7 @@ mono.bind("logo+return", mono.spawn(terminal))
 ```
 
 `mono.config` accepts `sloppy_focus`, `bypass_surface_visibility`, `log_level`,
-`appearance`, `input`, `rules`, `monitors`, `keybinds`, `buttons`, and
+`appearance`, `animations`, `input`, `rules`, `monitors`, `keybinds`, `buttons`, and
 `autostart`. Omitted fields keep their existing Lua global value/default.
 
 ## Base Options
@@ -62,6 +62,21 @@ mono.bind("logo+return", mono.spawn(terminal))
   is `"button_areas"` or `"clickfinger"`; `accel_profile` is `"adaptive"` or `"flat"`.
 
 Input values apply when a device appears and again on every config reload.
+
+## Animations
+
+```lua
+animations = {
+	enabled = true, -- false snaps everything into place
+	duration = 220, -- milliseconds
+}
+```
+
+Windows pop in when opened and fade out when closed, glide to new positions when
+the layout changes or they go fullscreen, and slide sideways when switching tags.
+On canvas tags, zoom eases toward each scroll step and a quick pan keeps gliding
+after release. Interactive moves and resizes follow the pointer without delay.
+Both settings reload live.
 
 ## Ordered Builders
 

@@ -35,6 +35,11 @@ typedef struct {
 	float        fullscreen_bg[4];
 } CfgAppearance;
 
+typedef struct {
+	bool enabled;
+	int  duration; /* ms */
+} CfgAnimations;
+
 /* Input */
 
 typedef struct {
@@ -108,6 +113,8 @@ typedef struct {
 
 typedef struct {
 	CfgAppearance appearance;
+
+	CfgAnimations animations;
 
 	CfgInput      input;
 

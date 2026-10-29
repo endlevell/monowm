@@ -25,7 +25,7 @@ XLIBS = xcb xcb-icccm
 # lua
 LUA_PKG = lua5.4
 
-PKGS      = wayland-server xkbcommon libinput $(LUA_PKG) $(XLIBS)
+PKGS      = scenefx-0.5 wayland-server xkbcommon libinput $(LUA_PKG) $(XLIBS)
 
 # Requires C11: _Alignas and anonymous unions in wlroots headers.
 CC = cc

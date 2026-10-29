@@ -24,6 +24,11 @@ mono.config {
 		fullscreen_bg = 0x000000ff,
 	},
 
+	animations = {
+		enabled = true,
+		duration = 220, -- ms
+	},
+
 	input = {
 		repeat_rate = 40,
 		repeat_delay = 250,

@@ -253,6 +253,20 @@ parse_appearance(lua_State *L, CfgAppearance *a)
 }
 
 static void
+parse_animations(lua_State *L, CfgAnimations *an)
+{
+	an->enabled  = true;
+	an->duration = 220;
+
+	lua_getglobal(L, "animations");
+	if (lua_istable(L, -1)) {
+		an->enabled  = lua_get_bool(L, "enabled", true);
+		an->duration = (int)lua_get_size(L, "duration", 220);
+	}
+	lua_pop(L, 1);
+}
+
+static void
 parse_input(lua_State *L, CfgInput *inp)
 {
 	lua_getglobal(L, "input");
@@ -621,7 +635,7 @@ l_mono_config(lua_State *L)
 {
 	static const char *const sections[] = {
 		"sloppy_focus", "bypass_surface_visibility", "log_level",
-		"appearance", "input", "rules", "monitors", "keybinds", "buttons", "autostart",
+		"appearance", "animations", "input", "rules", "monitors", "keybinds", "buttons", "autostart",
 	};
 
 	luaL_checktype(L, 1, LUA_TTABLE);
@@ -807,6 +821,7 @@ config_load(const char *path, Config *cfg)
 	}
 	lua_pop(L, 1);
 	parse_appearance(L, &cfg->appearance);
+	parse_animations(L, &cfg->animations);
 	parse_input     (L, &cfg->input);
 	parse_rules     (L, cfg);
 	parse_monitors  (L, cfg);

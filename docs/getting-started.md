@@ -11,6 +11,7 @@ mono currently targets Linux and wlroots 0.20. Required packages:
 - `pkg-config`
 - `wayland` and `wayland-protocols`
 - `wlroots-0.20` with its libinput backend
+- `scenefx-0.5`, the scene renderer used for animations (needs EGL and GLESv2)
 - `libinput`
 - `xkbcommon`
 - `lua5.4`
