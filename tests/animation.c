@@ -130,6 +130,7 @@ static void fixture_init(Fixture *f)
 	c->bw = 4;
 	c->placed = 1;
 	c->opacity = c->visual_scale = 1;
+	c->slide_opacity_from = 1;
 	c->surface.xdg = &f->xdg;
 	f->xdg.surface = f->surface;
 	f->xdg.toplevel = &f->toplevel;
@@ -336,6 +337,79 @@ static void closing(void)
 	cfg.animations.speed = 1;
 }
 
+static void transfer_arrival(int direction, int source_canvas, int target_canvas, uint32_t elapsed)
+{
+	Fixture f;
+	fixture_init(&f);
+	Client *c = &f.c;
+	uint32_t source = direction < 0 ? 4 : 1;
+	f.m.tagset[0] = c->tags = source;
+	f.m.canvas_tags = (source_canvas ? source : 0) | (target_canvas ? 2 : 0);
+	f.m.zoom = source_canvas || target_canvas ? 0.5 : 1;
+	c->geom = c->bounds = (struct wlr_box){f.m.m.x + 240, f.m.m.y + 70, 640, 400};
+	f.xdg.geometry = (struct wlr_box){0, 0, 632, 392};
+	f.toplevel.current.width = f.backing.width = 632;
+	f.toplevel.current.height = f.backing.height = 392;
+	wlr_scene_buffer_set_dest_size(f.buffer, 632, 392);
+	c->isfloating = c->incanvas = c->world_set = source_canvas;
+	c->world_x = f.m.m.x + (c->geom.x - f.m.m.x) / f.m.zoom;
+	c->world_y = f.m.m.y + (c->geom.y - f.m.m.y) / f.m.zoom;
+	c->world_width = 640;
+	c->world_height = 400;
+	client_render(c);
+	char args[CFG_MAX_ARGS][CFG_MAX_STRLEN] = {{0}};
+	strcpy(args[0], direction < 0 ? "-1" : "1");
+	dispatch_action("tagshift", args, 1);
+	assert(!wl_list_empty(&snapshots));
+	Snapshot *s = wl_container_of(snapshots.next, s, link);
+	assert(s->client == c);
+	now_ms = 1000 + elapsed;
+	assert(!snapshot_render(s, now_ms));
+	struct wlr_box displayed = s->frame;
+	displayed.x = s->tree->node.x;
+	displayed.y = s->tree->node.y;
+	double displayed_scale = s->scale;
+	wlr_scene_node_set_enabled(&c->scene->node, false);
+	/* Run the binding, then the layout work normally performed by arrange();
+	 * the fixture deliberately has no output backend. */
+	strcpy(args[0], "2");
+	locked = 1;
+	dispatch_action("view", args, 1);
+	locked = 0;
+	wlr_scene_node_set_enabled(&c->scene->node, true);
+	if (target_canvas) {
+		canvas_layout(&f.m);
+	} else {
+		struct wlr_box target = {f.m.m.x + 40, f.m.m.y + 30, 920, 640};
+		c->bounds = target;
+		f.toplevel.current.width = 912;
+		f.toplevel.current.height = 632;
+		resize(c, target, 0);
+	}
+	anim_transfer_arrivals(&f.m);
+	assert(wl_list_empty(&snapshots));
+	assert(c->scene->node.x == displayed.x && c->scene->node.y == displayed.y);
+	assert(abs(c->rendered.width - displayed.width) <= 1);
+	assert(abs(c->rendered.height - displayed.height) <= 1);
+	assert(fabs(c->visual_scale - displayed_scale) < 1e-6);
+	assert(c->slide_start && c->slide_to == 0 && !c->leaving);
+	assert_confined(c->scene, f.m.m);
+	now_ms += 50;
+	anim_tick();
+	assert_confined(c->scene, f.m.m);
+	assert(c->tags == 2 && c->mon == &f.m);
+	now_ms += 1200;
+	anim_tick();
+	assert(!c->slide_start && !c->geom_start && !c->leaving);
+	assert(c->scene->node.enabled && c->opacity == 1);
+	if (target_canvas)
+		assert(c->scene->node.x == f.m.m.x
+				+ (int)round((c->world_x - f.m.m.x - f.m.canvas_x) * f.m.zoom));
+	else
+		assert(c->scene->node.x == c->geom.x && c->scene->node.y == c->geom.y);
+	fixture_finish(&f);
+}
+
 static void sending(void)
 {
 	/* Exercise the real Lua action dispatch used by the user's bindings. */
@@ -419,6 +493,14 @@ static void sending(void)
 			fixture_finish(&f);
 		}
 	}
+	/* Early and late destination switches keep the currently displayed image
+	 * continuous, in either direction and across tiled/canvas layouts. */
+	for (int direction = -1; direction <= 1; direction += 2)
+		for (int source_canvas = 0; source_canvas <= 1; source_canvas++)
+			for (int target_canvas = 0; target_canvas <= 1; target_canvas++) {
+				transfer_arrival(direction, source_canvas, target_canvas, 50);
+				transfer_arrival(direction, source_canvas, target_canvas, 900);
+			}
 	/* Keep the existing tag invariants: no empty mask, and no departure when
 	 * the window still belongs to a currently displayed tag. */
 	Fixture f;
@@ -434,6 +516,12 @@ static void sending(void)
 	settags(&f.c, 2);
 	assert(f.c.tags == 2 && wl_list_empty(&snapshots));
 	cfg.animations.enabled = true;
+	f.c.tags = 1;
+	client_render(&f.c);
+	settags(&f.c, 2);
+	assert(!wl_list_empty(&snapshots));
+	anim_cancel_transfer(&f.c); /* The unmap path must release its owned picture. */
+	assert(wl_list_empty(&snapshots));
 	cfg.animations.speed = 1;
 	fixture_finish(&f);
 	fflush(stdout);

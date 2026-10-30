@@ -147,6 +147,8 @@ typedef struct {
 	uint32_t pop_start;          /* opening: grow and fade in */
 	uint32_t slide_start;        /* workspace switch: x offset slide_from -> slide_to */
 	int slide_from, slide_to;
+	int slide_from_y;
+	double slide_opacity_from;
 	int leaving;                 /* shown until its slide ends, though not VISIBLEON */
 	double opacity;              /* applied to buffers and border colors */
 	float inner_color[4], outer_color[4]; /* border colors before opacity */
@@ -869,6 +871,7 @@ arrange(Monitor *m)
 	}
 	if (m->lt[m->sellt]->arrange)
 		m->lt[m->sellt]->arrange(m);
+	anim_transfer_arrivals(m);
 	motionnotify(0, NULL, 0, 0, 0, 0);
 	checkidleinhibitor(NULL);
 }
@@ -2427,6 +2430,7 @@ mapnotify(struct wl_listener *listener, void *data)
 	wl_list_init(&c->canvas_nodes);
 	c->visual_scale = 1.0;
 	c->opacity = 1.0;
+	c->slide_opacity_from = 1.0;
 	LISTEN(&client_surface(c)->events.new_subsurface, &c->new_subsurface,
 			canvas_new_subsurface);
 	/* Enabled later by a call to arrange() */
@@ -4634,6 +4638,7 @@ unmapnotify(struct wl_listener *listener, void *data)
 {
 	/* Called when the surface is unmapped, and should no longer be shown. */
 	Client *c = wl_container_of(listener, c, unmap);
+	anim_cancel_transfer(c);
 
 	if (!client_is_unmanaged(c))
 		anim_close(c);

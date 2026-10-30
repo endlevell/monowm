@@ -58,10 +58,14 @@ typedef struct {
 	Monitor *mon;
 	uint32_t source_tags, target_tags; /* workspace transfers */
 	int x, slide_to;
+	Client *client;                  /* live owner of a workspace transfer */
+	struct wlr_box frame;            /* full displayed frame before monitor clipping */
+	double scale, opacity;
 } Snapshot;
 
 static struct wl_list snapshots;
 static int snapshot_render(Snapshot *s, uint32_t now);
+static void anim_cancel_transfer(Client *c);
 
 static uint32_t
 anim_now(void)
@@ -273,6 +277,8 @@ client_render(Client *c)
 	if (c->slide_start) {
 		t = anim_progress(ANIM_WORKSPACE, c->slide_start, now);
 		x += anim_lerp(c->slide_from, c->slide_to, t);
+		y += anim_lerp(c->slide_from_y, 0, t);
+		opacity *= c->slide_opacity_from + (1.0 - c->slide_opacity_from) * t;
 		if (t >= 1.0) {
 			c->slide_start = 0;
 			if (c->leaving) {
@@ -332,6 +338,12 @@ anim_view(Monitor *m, uint32_t old, uint32_t new)
 		if (c->mon != m || !(c->tags & old) == !(c->tags & new))
 			continue;
 		entering = (c->tags & new) != 0;
+		c->slide_from_y = c->slide_start
+				? anim_lerp(c->slide_from_y, 0,
+						anim_progress(ANIM_WORKSPACE, c->slide_start, now)) : 0;
+		c->slide_opacity_from = c->slide_start
+				? c->slide_opacity_from + (1.0 - c->slide_opacity_from)
+						* anim_progress(ANIM_WORKSPACE, c->slide_start, now) : 1.0;
 		/* Reverse from wherever a window is if it was already sliding */
 		off = c->slide_start
 				? anim_lerp(c->slide_from, c->slide_to, anim_progress(ANIM_WORKSPACE, c->slide_start, now))
@@ -588,6 +600,12 @@ snapshot_create(Client *c)
 	s->animation = ANIM_CLOSE;
 	s->mon = c->mon;
 	s->x = c->scene->node.x;
+	double pop = c->pop_start ? ANIM_OPEN_SCALE + (1.0 - ANIM_OPEN_SCALE) * c->opacity : 1.0;
+	s->frame = (struct wlr_box){s->x, c->scene->node.y,
+			MAX(1, (int)round(c->rendered.width * pop)),
+			MAX(1, (int)round(c->rendered.height * pop))};
+	s->scale = c->visual_scale;
+	s->opacity = c->opacity;
 	s->start = anim_start();
 	wl_list_insert(&snapshots, &s->link);
 	return s;
@@ -607,12 +625,14 @@ anim_send(Client *c, uint32_t newtags)
 {
 	Monitor *m = c->mon;
 	Snapshot *s;
+	anim_cancel_transfer(c);
 
 	if (!VISIBLEON(c, m) || (newtags & m->tagset[m->seltags]))
 		return;
 	if (!(s = snapshot_create(c)))
 		return;
 	s->animation = ANIM_WORKSPACE;
+	s->client = c;
 	s->source_tags = c->tags & m->tagset[m->seltags];
 	s->target_tags = newtags;
 	s->slide_to = __builtin_ctz(newtags) > __builtin_ctz(s->source_tags)
@@ -627,6 +647,49 @@ snapshot_destroy(Snapshot *s)
 	wlr_scene_node_destroy(&s->tree->node);
 	wl_array_release(&s->parts);
 	free(s);
+}
+
+static void
+anim_cancel_transfer(Client *c)
+{
+	Snapshot *s, *tmp;
+	wl_list_for_each_safe(s, tmp, &snapshots, link)
+		if (s->client == c)
+			snapshot_destroy(s);
+}
+
+/* Complete the picture-to-client handoff after the destination layout has
+ * placed the live window. Both pictures occupy the same pixels at this point. */
+static void
+anim_transfer_arrivals(Monitor *m)
+{
+	Snapshot *s, *tmp;
+	uint32_t now = anim_now();
+
+	wl_list_for_each_safe(s, tmp, &snapshots, link) {
+		Client *c = s->client;
+		if (s->mon != m || !c || !VISIBLEON(c, m))
+			continue;
+		if (anim_progress(ANIM_WORKSPACE, s->start, now) < 1.0 && anim_enabled()) {
+			double zoom = canvas_active(c) ? m->zoom : 1.0;
+			struct wlr_box base = c->rendered;
+			uint32_t start = anim_start();
+			c->geom_from = client_displayed_geom(c, now);
+			c->geom_from.width = MAX(1, (int)round(s->frame.width / zoom));
+			c->geom_from.height = MAX(1, (int)round(s->frame.height / zoom));
+			c->geom_scale_from = s->scale / zoom;
+			c->geom_start = start;
+			c->slide_from = s->tree->node.x - base.x;
+			c->slide_to = 0;
+			c->slide_from_y = s->tree->node.y - base.y;
+			c->slide_opacity_from = s->opacity;
+			c->slide_start = start;
+			c->pop_start = 0;
+			c->leaving = 0;
+			client_render(c);
+		}
+		snapshot_destroy(s);
+	}
 }
 
 /* Returns 1 once s has finished */
