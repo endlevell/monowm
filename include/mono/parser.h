@@ -85,11 +85,15 @@ typedef struct {
 /* keybinds */
 
 typedef struct {
+	char action[CFG_MAX_STRLEN];
+	char (*args)[CFG_MAX_STRLEN];
+	int nargs;
+} CfgCommand;
+
+typedef struct {
 	uint32_t mods;                         /* WLR_MODIFIER_* bitmask */
 	uint32_t key;                          /* XKB keysym */
-	char     action[CFG_MAX_STRLEN];       /* "spawn", "killclient", etc. */
-	char     args[CFG_MAX_ARGS][CFG_MAX_STRLEN];
-	int      nargs;
+	CfgCommand *command;                  /* only legacy action bindings */
 	int      lua_ref;                      /* LUA_NOREF unless bound via mono.bind() */
 } CfgKeybind;
 
@@ -98,9 +102,7 @@ typedef struct {
 typedef struct {
 	uint32_t mods;
 	uint32_t button;
-	char     action[CFG_MAX_STRLEN];
-	char     args[CFG_MAX_ARGS][CFG_MAX_STRLEN];
-	int      nargs;
+	CfgCommand *command;
 } CfgButton;
 
 /* Autostart */
@@ -124,10 +126,10 @@ typedef struct {
 	CfgMonitorRule monitors[CFG_MAX_MONITORS];
 	int            nmonitors;
 
-	CfgKeybind    keybinds[CFG_MAX_KEYBINDS];
+	CfgKeybind    *keybinds;
 	int           nkeybinds;
 
-	CfgButton     buttons[CFG_MAX_KEYBINDS];
+	CfgButton     *buttons;
 	int           nbuttons;
 
 	bool          sloppyfocus;
@@ -140,7 +142,9 @@ typedef struct {
 
 /* Public API */
 
+/* Initialize cfg to zero. Loading is transactional; finish releases storage. */
 int config_load(const char *path, Config *cfg);
+void config_finish(Config *cfg);
 
 char *config_get_path(char *buf, size_t bufsz);
 
@@ -153,7 +157,8 @@ void config_apply_keybinds(const Config *cfg);
 void config_autostart_run(const CfgAutostart *cmds, int n);
 void config_autostart_stop(void);
 
-typedef void (*config_reload_cb)(const Config *cfg, void *userdata);
+/* A callback may take ownership by moving cfg and clearing it to zero. */
+typedef void (*config_reload_cb)(Config *cfg, void *userdata);
 
 struct wl_event_source *config_watch_start(
 	struct wl_event_loop *loop,

@@ -10,32 +10,20 @@ static void printstatus(void);
 /* globals  */
 
 static struct wl_global *ipc_global = NULL;
-/* All bound manager objects */
-static struct wl_list ipc_managers; /* IpcManager.link */
+/* Output subscriptions outlive the manager that created them. */
+static struct wl_list ipc_outputs; /* IpcOutput.link; independent of managers */
 
 typedef struct {
 	struct wl_resource     *resource;
-	struct wl_list          link;     /* ipc_managers */
-	struct wl_list          outputs;  /* IpcOutput.link */
 } IpcManager;
 
 typedef struct {
 	struct wl_resource     *resource;
 	Monitor                *mon;
-	struct wl_list          link;     /* IpcManager.outputs */
+	struct wl_list          link;     /* ipc_outputs */
 } IpcOutput;
 
 /* helpers  */
-
-static IpcOutput *
-ipc_output_for_mon(IpcManager *mgr, Monitor *m)
-{
-	IpcOutput *o;
-	wl_list_for_each(o, &mgr->outputs, link)
-		if (o->mon == m)
-			return o;
-	return NULL;
-}
 
 /* Send the full state of monitor m to one IpcOutput resource */
 static void
@@ -43,21 +31,9 @@ ipc_send_output_state(IpcOutput *ipc_out)
 {
 	Monitor *m = ipc_out->mon;
 	struct wl_resource *res = ipc_out->resource;
-	Client *c;
-	uint32_t occ = 0, urg = 0, sel_tags = 0;
+	Client *c = m->status.focused;
+	uint32_t urg = m->status.urgent, sel_tags = m->status.selected;
 	int tag, focused;
-
-	/* Compute occupancy/urgency (same logic as printstatus, I think) */
-	wl_list_for_each(c, &clients, link) {
-		if (c->mon != m)
-			continue;
-		occ |= c->tags;
-		if (c->isurgent)
-			urg |= c->tags;
-	}
-
-	c = focustop(m);
-	sel_tags = c ? c->tags : 0;
 
 	/* active */
 	zdwl_ipc_output_v2_send_active(res, m == selmon ? 1 : 0);
@@ -73,8 +49,7 @@ ipc_send_output_state(IpcOutput *ipc_out)
 			state |= ZDWL_IPC_OUTPUT_V2_TAG_STATE_ACTIVE;
 		if (urg & mask)
 			state |= ZDWL_IPC_OUTPUT_V2_TAG_STATE_URGENT;
-		if (occ & mask)
-			clients_on_tag = 1; /* report ≥1, not exact count */
+		clients_on_tag = m->status.counts[tag];
 
 		focused = (sel_tags & mask) ? 1 : 0;
 		zdwl_ipc_output_v2_send_tag(res, tag, state, clients_on_tag, focused);
@@ -117,16 +92,10 @@ ipc_send_output_state(IpcOutput *ipc_out)
 static void
 ipc_printstatus(void)
 {
-	IpcManager *mgr;
-	Monitor *m;
-
-	wl_list_for_each(mgr, &ipc_managers, link) {
-		wl_list_for_each(m, &mons, link) {
-			IpcOutput *out = ipc_output_for_mon(mgr, m);
-			if (out)
-				ipc_send_output_state(out);
-		}
-	}
+	IpcOutput *out;
+	wl_list_for_each(out, &ipc_outputs, link)
+		if (out->mon)
+			ipc_send_output_state(out);
 }
 
 /* Detach outputs bound to a monitor that is being freed; their requests
@@ -134,13 +103,10 @@ ipc_printstatus(void)
 static void
 ipc_cleanupmon(Monitor *m)
 {
-	IpcManager *mgr;
 	IpcOutput *out;
-
-	wl_list_for_each(mgr, &ipc_managers, link)
-		wl_list_for_each(out, &mgr->outputs, link)
-			if (out->mon == m)
-				out->mon = NULL;
+	wl_list_for_each(out, &ipc_outputs, link)
+		if (out->mon == m)
+			out->mon = NULL;
 }
 
 /* zdwl_ipc_output_v2 requests */
@@ -157,7 +123,7 @@ ipc_output_handle_set_tags(struct wl_client *client, struct wl_resource *resourc
 {
 	IpcOutput *out = wl_resource_get_user_data(resource);
 	Monitor *m = out->mon;
-	if (!m) return;
+	if (!m || !(tagmask &= TAGMASK)) return;
 
 	if (toggle_tagset)
 		m->seltags ^= 1;
@@ -193,7 +159,7 @@ ipc_output_handle_set_layout(struct wl_client *client,
 	if (!m || idx >= LENGTH(layouts)) return;
 
 	m->lt[m->sellt] = &layouts[idx];
-	strncpy(m->ltsymbol, layouts[idx].symbol, LENGTH(m->ltsymbol));
+	snprintf(m->ltsymbol, sizeof(m->ltsymbol), "%s", layouts[idx].symbol);
 	arrange(m);
 	printstatus();
 }
@@ -225,7 +191,6 @@ static void
 ipc_manager_handle_get_output(struct wl_client *client, struct wl_resource *resource,
 		uint32_t id, struct wl_resource *output_resource)
 {
-	IpcManager *mgr = wl_resource_get_user_data(resource);
 	struct wlr_output *wlr_out = wlr_output_from_resource(output_resource);
 	Monitor *m = (wlr_out && wlr_out->data) ? wlr_out->data : NULL;
 
@@ -240,10 +205,12 @@ ipc_manager_handle_get_output(struct wl_client *client, struct wl_resource *reso
 	}
 	wl_resource_set_implementation(out->resource, &ipc_output_impl,
 			out, ipc_output_destroy);
-	wl_list_insert(&mgr->outputs, &out->link);
+	wl_list_insert(&ipc_outputs, &out->link);
 
-	if (m)
+	if (m) {
+		status_collect(m, &m->status);
 		ipc_send_output_state(out);
+	}
 }
 
 static const struct zdwl_ipc_manager_v2_interface ipc_manager_impl = {
@@ -255,10 +222,6 @@ static void
 ipc_manager_destroy(struct wl_resource *resource)
 {
 	IpcManager *mgr = wl_resource_get_user_data(resource);
-	IpcOutput *out, *tmp;
-	wl_list_for_each_safe(out, tmp, &mgr->outputs, link)
-		wl_resource_destroy(out->resource);
-	wl_list_remove(&mgr->link);
 	free(mgr);
 }
 
@@ -268,7 +231,6 @@ static void
 ipc_bind(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 {
 	IpcManager *mgr = ecalloc(1, sizeof(*mgr));
-	wl_list_init(&mgr->outputs);
 	mgr->resource = wl_resource_create(client, &zdwl_ipc_manager_v2_interface,
 			version, id);
 	if (!mgr->resource) {
@@ -278,7 +240,6 @@ ipc_bind(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 	}
 	wl_resource_set_implementation(mgr->resource, &ipc_manager_impl,
 			mgr, ipc_manager_destroy);
-	wl_list_insert(&ipc_managers, &mgr->link);
 
 	/* Announce tags and layouts */
 	zdwl_ipc_manager_v2_send_tags(mgr->resource, TAGCOUNT);
@@ -289,7 +250,7 @@ ipc_bind(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 static void
 ipc_init(void)
 {
-	wl_list_init(&ipc_managers);
+	wl_list_init(&ipc_outputs);
 	ipc_global = wl_global_create(dpy, &zdwl_ipc_manager_v2_interface,
 			2, NULL, ipc_bind);
 }

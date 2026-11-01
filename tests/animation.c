@@ -11,6 +11,14 @@
 
 static uint32_t now_ms = 1000;
 static int frames;
+static int scheduled_frames;
+static struct wlr_output *scheduled_output;
+
+static void test_schedule_frame(struct wlr_output *output)
+{
+	scheduled_frames++;
+	scheduled_output = output;
+}
 
 static int test_clock_gettime(clockid_t id, struct timespec *ts)
 {
@@ -28,6 +36,14 @@ static bool test_output_commit(struct wlr_scene_output *output,
 
 static void test_frame_done(struct wlr_scene_output *output, struct timespec *ts) {}
 
+static int output_tests, constraint_activations, constraint_deactivations;
+static bool test_output_test_state(struct wlr_output *output,
+		const struct wlr_output_state *state)
+{
+	output_tests++;
+	return true;
+}
+
 /* A running client, irrespective of this test process's parent/child status. */
 static int test_waitid(idtype_t type, id_t id, siginfo_t *info, int options)
 {
@@ -39,6 +55,10 @@ static int test_waitid(idtype_t type, id_t id, siginfo_t *info, int options)
 #define wlr_scene_output_commit test_output_commit
 #define wlr_scene_output_send_frame_done test_frame_done
 #define waitid test_waitid
+#define wlr_output_schedule_frame test_schedule_frame
+#define wlr_output_test_state test_output_test_state
+#define wlr_pointer_constraint_v1_send_activated test_constraint_activated
+#define wlr_pointer_constraint_v1_send_deactivated test_constraint_deactivated
 #define main mono_main
 #ifndef MONO_SOURCE
 #define MONO_SOURCE "../src/main.c"
@@ -53,6 +73,22 @@ static int test_waitid(idtype_t type, id_t id, siginfo_t *info, int options)
 #undef wlr_scene_output_send_frame_done
 #undef wlr_scene_output_commit
 #undef clock_gettime
+#undef wlr_output_schedule_frame
+#undef wlr_output_test_state
+#undef wlr_pointer_constraint_v1_send_activated
+#undef wlr_pointer_constraint_v1_send_deactivated
+
+void test_constraint_activated(struct wlr_pointer_constraint_v1 *constraint)
+{
+	assert(active_constraint == constraint);
+	constraint_activations++;
+}
+
+void test_constraint_deactivated(struct wlr_pointer_constraint_v1 *constraint)
+{
+	assert(!active_constraint);
+	constraint_deactivations++;
+}
 
 static struct wl_client *test_client;
 static struct wl_display *client_display;
@@ -89,6 +125,10 @@ static void new_surface_test(struct wl_listener *listener, void *data)
 static void buffer_destroy(struct wlr_buffer *buffer) {}
 static const struct wlr_buffer_impl buffer_impl = {.destroy = buffer_destroy};
 static const struct wl_interface toplevel_interface = {.name = "xdg_toplevel", .version = 6};
+static const struct wl_interface surface_interface = {.name = "xdg_surface", .version = 6};
+static struct wlr_xdg_shell test_xdg_shell = {.version = 6};
+
+static int configure_pending(void *data) { return 0; }
 
 typedef struct {
 	Client c;
@@ -134,8 +174,15 @@ static void fixture_init(Fixture *f)
 	c->surface.xdg = &f->xdg;
 	f->xdg.surface = f->surface;
 	f->xdg.toplevel = &f->toplevel;
+	f->toplevel.base = &f->xdg;
 	f->xdg.client = &f->xdg_client;
 	f->xdg_client.client = test_client;
+	f->xdg_client.shell = &test_xdg_shell;
+	f->xdg.resource = wl_resource_create(test_client, &surface_interface, 6, 0);
+	f->xdg.initialized = true;
+	/* Keep configure requests pending without sending fake XDG resources. */
+	f->xdg.configure_idle = wl_event_loop_add_timer(event_loop, configure_pending, NULL);
+	f->xdg.scheduled_serial = 123;
 	f->xdg.geometry = (struct wlr_box){0, 0, 992, 692};
 	f->toplevel.resource = wl_resource_create(test_client, &toplevel_interface, 6, 0);
 	f->toplevel.current.width = 992;
@@ -157,6 +204,7 @@ static void fixture_init(Fixture *f)
 	wlr_buffer_init(&f->backing, &buffer_impl, 992, 692);
 	f->buffer = wlr_scene_buffer_create(c->scene_surface, &f->backing);
 	wlr_scene_buffer_set_dest_size(f->buffer, 992, 692);
+	f->m.fullscreen_bg = wlr_scene_rect_create(layers[LyrFS], 0, 0, (float[4]){0, 0, 0, 1});
 }
 
 static void fixture_finish(Fixture *f)
@@ -164,11 +212,14 @@ static void fixture_finish(Fixture *f)
 	canvas_clear(&f->c);
 	wl_list_remove(&f->c.commit.link);
 	wlr_scene_node_destroy(&f->c.scene->node);
+	wlr_scene_node_destroy(&f->m.fullscreen_bg->node);
 	wlr_buffer_drop(&f->backing);
 	wl_list_remove(&f->surface_output.link);
 	wl_surface_destroy(f->client_surface);
 	dispatch_requests();
 	wl_resource_destroy(f->toplevel.resource);
+	wl_resource_destroy(f->xdg.resource);
+	wl_event_source_remove(f->xdg.configure_idle);
 	wl_list_remove(&f->m.link);
 	wl_list_remove(&f->c.link);
 	wl_list_remove(&f->c.flink);
@@ -395,11 +446,11 @@ static void transfer_arrival(int direction, int source_canvas, int target_canvas
 	assert(c->slide_start && c->slide_to == 0 && !c->leaving);
 	assert_confined(c->scene, f.m.m);
 	now_ms += 50;
-	anim_tick();
+	anim_tick(selmon);
 	assert_confined(c->scene, f.m.m);
 	assert(c->tags == 2 && c->mon == &f.m);
 	now_ms += 1200;
-	anim_tick();
+	anim_tick(selmon);
 	assert(!c->slide_start && !c->geom_start && !c->leaving);
 	assert(c->scene->node.enabled && c->opacity == 1);
 	if (target_canvas)
@@ -684,18 +735,18 @@ static void canvas_toggle(void)
 	assert(f.m.zoom == 1 && f.m.zoom_start && f.m.zoom_to == CANVAS_OVERVIEW_ZOOM);
 	assert(f.buffer->dst_width == 992);
 	now_ms = 1050;
-	anim_tick();
+	anim_tick(selmon);
 	assert(f.m.zoom > CANVAS_OVERVIEW_ZOOM && f.m.zoom < 1);
 	assert(f.buffer->dst_width > (int)round(992 * CANVAS_OVERVIEW_ZOOM));
 	assert(f.buffer->dst_width < 992);
 	assert(f.m.backdrop_mix > 0 && f.m.backdrop_mix < 1);
 	now_ms = 1301;
-	anim_tick();
+	anim_tick(selmon);
 	assert(f.m.zoom == CANVAS_OVERVIEW_ZOOM && !f.m.zoom_start);
 	assert(f.buffer->dst_width == (int)round(992 * CANVAS_OVERVIEW_ZOOM));
 	/* The overview zoom must not leave a synthetic pan to recenter afterward. */
 	assert(f.m.backdrop_offset_x == 0 && f.m.backdrop_offset_y == 0);
-	assert(!anim_tick());
+	assert(!anim_tick(selmon));
 	struct wlr_box overview = f.c.rendered;
 	int content_width = f.buffer->dst_width;
 	dispatch_action("togglecanvas", NULL, 0);
@@ -707,24 +758,24 @@ static void canvas_toggle(void)
 	assert(abs(f.buffer->dst_width - content_width) <= 1);
 	assert(f.c.scene->node.x == overview.x && f.c.scene->node.y == overview.y);
 	now_ms = 1351;
-	anim_tick();
+	anim_tick(selmon);
 	assert(f.c.rendered.width > overview.width && f.c.rendered.width < tiled.width);
 	assert(f.xdg.geometry.width == 992); /* Applications keep native dimensions. */
 	now_ms = 1602;
-	anim_tick();
+	anim_tick(selmon);
 	assert(wlr_box_equal(&f.c.rendered, &tiled));
 	assert(f.m.backdrop_mix == 0 && f.buffer->dst_width == 992);
 	/* Reversing a toggle mid-transition starts at the displayed frame. */
 	dispatch_action("togglecanvas", NULL, 0);
 	canvas_layout(&f.m);
 	now_ms = 1652;
-	anim_tick();
+	anim_tick(selmon);
 	content_width = f.buffer->dst_width;
 	dispatch_action("togglecanvas", NULL, 0);
 	resize(&f.c, tiled, 0);
 	assert(abs(f.buffer->dst_width - content_width) <= 1);
 	now_ms = 1677;
-	anim_tick();
+	anim_tick(selmon);
 	content_width = f.buffer->dst_width;
 	struct wlr_box reversing = f.c.rendered;
 	dispatch_action("togglecanvas", NULL, 0);
@@ -743,7 +794,7 @@ static void canvas_toggle(void)
 	canvas_layout(&f.m);
 	assert(f.m.canvas_tags == 2 && f.buffer->dst_width == 992);
 	now_ms = 1301;
-	anim_tick();
+	anim_tick(selmon);
 	assert(f.buffer->dst_width == (int)round(992 * CANVAS_OVERVIEW_ZOOM));
 	fixture_finish(&f);
 	/* Disabled animations still enter the overview immediately. */
@@ -790,16 +841,16 @@ static void wallpaper(void)
 			f.m.m.x + f.m.m.width / 2.0, f.m.m.y + f.m.m.height / 2.0);
 	double previous_width = original.width;
 	for (now_ms = 1025; now_ms <= 1450; now_ms += 25) {
-		anim_tick();
+		anim_tick(selmon);
 		assert(f.m.backdrop_offset_x == 0 && f.m.backdrop_offset_y == 0);
 		assert(native->src_box.width <= previous_width);
 		previous_width = native->src_box.width;
 	}
 	now_ms = 1462;
-	assert(!anim_tick());
+	assert(!anim_tick(selmon));
 	struct wlr_fbox entered = native->src_box;
 	now_ms = 1800;
-	assert(!anim_tick());
+	assert(!anim_tick(selmon));
 	assert(wlr_fbox_equal(&native->src_box, &entered));
 	cfg.animations.speed = 1;
 	f.m.backdrop_mix = 0;
@@ -830,10 +881,10 @@ static void wallpaper(void)
 	now_ms = 3000; /* Pause while holding the button, then release. */
 	pan_release(&f.m);
 	now_ms = 3050;
-	anim_tick();
+	anim_tick(selmon);
 	assert(native->src_box.x < dragged.x && native->src_box.x > far.x);
 	now_ms = 4000;
-	anim_tick();
+	anim_tick(selmon);
 	assert(wlr_fbox_equal(&native->src_box, &far));
 	f.m.canvas_tags = 0;
 	f.m.tagset[0] = 1;
@@ -900,6 +951,11 @@ static void wallpaper(void)
 	fixture_finish(&f);
 }
 
+#include "bugs.h"
+#ifdef MONO_PERFORMANCE
+#include "performance.h"
+#endif
+
 int main(int argc, char **argv)
 {
 	int sockets[2];
@@ -926,11 +982,14 @@ int main(int argc, char **argv)
 	assert(client_shm);
 	seat = wlr_seat_create(dpy, "test-seat");
 	assert(seat);
+	pointer_constraints = wlr_pointer_constraints_v1_create(dpy);
+	idle_inhibit_mgr = wlr_idle_inhibit_v1_create(dpy);
+	idle_notifier = wlr_idle_notifier_v1_create(dpy);
 	wl_list_init(&clients);
 	wl_list_init(&fstack);
 	wl_list_init(&mons);
 	wl_list_init(&snapshots);
-	wl_list_init(&ipc_managers);
+	wl_list_init(&ipc_outputs);
 	wl_list_init(&ext_workspaces);
 	scene = wlr_scene_create();
 	for (int i = 0; i < NUM_LAYERS; i++)
@@ -940,6 +999,10 @@ int main(int argc, char **argv)
 	assert(cursor);
 	cfg.animations.enabled = true;
 	cfg.animations.speed = 1;
+#ifdef MONO_PERFORMANCE
+	if (argc > 1 && !strcmp(argv[1], "performance")) performance();
+#endif
+	if (argc == 1 || !strcmp(argv[1], "bugs")) bug_regressions();
 	if (argc == 1 || !strcmp(argv[1], "workspace")) workspace();
 	if (argc == 1 || !strcmp(argv[1], "opening")) opening();
 	if (argc == 1 || !strcmp(argv[1], "closing")) closing();

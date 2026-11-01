@@ -26,19 +26,8 @@ static struct wl_listener ext_destroy_listener;
 static int
 get_tag_status(uint32_t tag, Monitor *m)
 {
-	Client *c;
-	uint32_t mask = 1 << (tag - 1);
-
-	wl_list_for_each(c, &clients, link) {
-		if (c->mon != m)
-			continue;
-		if (!(c->tags & mask))
-			continue;
-		if (c->isurgent)
-			return 2;
-		return 1;
-	}
-	return 0;
+	uint32_t mask = 1u << (tag - 1);
+	return m->status.urgent & mask ? 2 : !!(m->status.occupied & mask);
 }
 
 static const char *
@@ -66,12 +55,21 @@ static void
 ext_workspace_create(uint32_t tag, Monitor *m)
 {
 	const char *name = tag_name(tag);
+	size_t len = strlen(m->wlr_output->name) + 32;
+	char *id = ecalloc(len, 1);
+	snprintf(id, len, "%s:%u", m->wlr_output->name, tag);
+	struct ext_workspace *existing;
+	int unique = 1;
+	wl_list_for_each(existing, &ext_workspaces, link)
+		if (existing->handle->id && !strcmp(existing->handle->id, id))
+			unique = 0;
 
 	struct ext_workspace *ws = ecalloc(1, sizeof(*ws));
 	ws->tag = tag;
 	ws->m = m;
 	ws->handle = wlr_ext_workspace_handle_v1_create(
-			ext_workspace_manager, name, EXT_WORKSPACE_CAPS);
+			ext_workspace_manager, unique ? id : NULL, EXT_WORKSPACE_CAPS);
+	free(id);
 	ws->handle->data = ws;
 
 	wlr_ext_workspace_handle_v1_set_group(ws->handle, m->ext_group);

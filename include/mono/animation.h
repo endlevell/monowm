@@ -76,12 +76,10 @@ anim_now(void)
 }
 
 static void
-anim_schedule(void)
+anim_schedule(Monitor *m)
 {
-	Monitor *m;
-	wl_list_for_each(m, &mons, link)
-		if (m->wlr_output->enabled)
-			wlr_output_schedule_frame(m->wlr_output);
+	if (m && m->wlr_output->enabled)
+		wlr_output_schedule_frame(m->wlr_output);
 }
 
 static int
@@ -92,12 +90,12 @@ anim_enabled(void)
 
 /* Start time for a new animation, or 0 when animations are off */
 static uint32_t
-anim_start(void)
+anim_start(Monitor *m)
 {
 	uint32_t now;
 	if (!anim_enabled())
 		return 0;
-	anim_schedule();
+	anim_schedule(m);
 	now = anim_now();
 	return now ? now : 1;
 }
@@ -148,9 +146,8 @@ anim_lerp(int a, int b, double t)
 
 /* The box c is displayed at: c->geom, or on its way there */
 static struct wlr_box
-client_displayed_geom(Client *c, uint32_t now)
+client_geom_at(Client *c, double t)
 {
-	double t = anim_progress(ANIM_MOVE, c->geom_start, now);
 	if (t >= 1.0)
 		return c->geom;
 	return (struct wlr_box){
@@ -159,6 +156,12 @@ client_displayed_geom(Client *c, uint32_t now)
 		.width = anim_lerp(c->geom_from.width, c->geom.width, t),
 		.height = anim_lerp(c->geom_from.height, c->geom.height, t),
 	};
+}
+
+static struct wlr_box
+client_displayed_geom(Client *c, uint32_t now)
+{
+	return client_geom_at(c, anim_progress(ANIM_MOVE, c->geom_start, now));
 }
 
 static double
@@ -237,10 +240,12 @@ client_render(Client *c)
 	if (!m || !c->scene)
 		return;
 
-	box = client_displayed_geom(c, now);
-	if (anim_progress(ANIM_MOVE, c->geom_start, now) >= 1.0)
+	double move = anim_progress(ANIM_MOVE, c->geom_start, now);
+	box = client_geom_at(c, move);
+	if (move >= 1.0)
 		c->geom_start = 0;
-	scale = client_frame_scale(c, now);
+	double from_scale = c->geom_scale_from > 0 ? c->geom_scale_from : 1.0;
+	scale = from_scale + (1.0 - from_scale) * move;
 	/* Interpolate the frame in screen/native-canvas units while retaining
 	 * optical border thickness through a canvas mode change. */
 	box.width = MAX(1, (int)round(box.width / scale));
@@ -288,13 +293,41 @@ client_render(Client *c)
 		}
 	}
 
+	/* Reuse native geometry for translations and scale-only changes.
+	 * Commits, new surfaces, node destruction, and explicit restoration
+	 * invalidate this cache before a native helper can change the tree. */
+	if (c->render_valid && !c->canvas_refresh && !c->slide_start && !c->canvas_clipped
+			&& c->render_native.width == box.width && c->render_native.height == box.height
+			&& wlr_box_equal(&c->render_content, &content)
+			&& c->render_ibw == c->ibw && c->render_obw == c->obw) {
+		wlr_scene_node_set_position(&c->scene->node, x, y);
+		if (c->render_scale != scale) {
+			if (scale != 1.0 || c->content_scale_x != 1.0 || c->content_scale_y != 1.0)
+				canvas_apply(c, scale, 0);
+			else
+				canvas_restore(c);
+			c->render_scale = scale;
+			c->render_valid = 1;
+		}
+		client_set_opacity(c, opacity);
+		return;
+	}
+
 	/* Scaling rewrites node geometry, so lay out unscaled first */
-	canvas_restore(c);
+	canvas_unapply(c);
 	client_place(c, box.width, box.height, &content);
+	c->render_native = box;
 	wlr_scene_node_set_position(&c->scene->node, x, y);
 	if (scale != 1.0 || c->content_scale_x != 1.0 || c->content_scale_y != 1.0
 			|| c->slide_start)
-		canvas_apply(c, scale);
+		canvas_apply(c, scale, 1);
+	else
+		canvas_restore(c);
+	c->render_content = content;
+	c->render_scale = scale;
+	c->render_ibw = c->ibw;
+	c->render_obw = c->obw;
+	c->render_valid = 1;
 	client_set_opacity(c, opacity);
 }
 
@@ -302,7 +335,7 @@ client_render(Client *c)
 static void
 anim_open(Client *c)
 {
-	c->pop_start = anim_start();
+	c->pop_start = anim_start(c->mon);
 	client_render(c);
 }
 
@@ -314,7 +347,7 @@ anim_canvas_leave(Client *c)
 	int animate = c->incanvas && !c->isfullscreen && !wlr_box_empty(&from);
 
 	canvas_leave(c);
-	if (animate && (c->geom_start = anim_start())) {
+	if (animate && (c->geom_start = anim_start(c->mon))) {
 		c->geom_from = from;
 		c->geom_scale_from = scale;
 		client_render(c);
@@ -331,7 +364,7 @@ anim_view(Monitor *m, uint32_t old, uint32_t new)
 	int dir, off, entering;
 	Client *c;
 
-	if (!old || !new || !(start = anim_start()))
+	if (!old || !new || !(start = anim_start(m)))
 		return;
 	dir = __builtin_ctz(new) > __builtin_ctz(old) ? 1 : -1;
 	wl_list_for_each(c, &clients, link) {
@@ -357,7 +390,7 @@ anim_view(Monitor *m, uint32_t old, uint32_t new)
 
 /* Canvas zoom keeping (zoom_wx, zoom_wy) under the anchor (zoom_ax, zoom_ay) */
 static void
-zoom_apply(Monitor *m, double zoom)
+zoom_set(Monitor *m, double zoom)
 {
 	double x = m->zoom_wx - m->zoom_ax / zoom;
 	double y = m->zoom_wy - m->zoom_ay / zoom;
@@ -368,6 +401,12 @@ zoom_apply(Monitor *m, double zoom)
 	m->zoom = zoom;
 	m->canvas_x = x;
 	m->canvas_y = y;
+}
+
+static void
+zoom_apply(Monitor *m, double zoom)
+{
+	zoom_set(m, zoom);
 	canvas_layout(m);
 }
 
@@ -382,7 +421,7 @@ anim_zoom_at(Monitor *m, double zoom, double x, double y)
 	m->zoom_wy = m->canvas_y + m->zoom_ay / m->zoom;
 	m->zoom_from = m->zoom;
 	m->zoom_to = zoom;
-	if (!(m->zoom_start = anim_start()))
+	if (!(m->zoom_start = anim_start(m)))
 		zoom_apply(m, zoom);
 }
 
@@ -400,7 +439,7 @@ anim_backdrop(Monitor *m, int canvas)
 		return;
 	m->backdrop_from = m->backdrop_mix;
 	m->backdrop_to = target;
-	if (!(m->backdrop_start = anim_start()))
+	if (!(m->backdrop_start = anim_start(m)))
 		m->backdrop_mix = target;
 	backdrop_update(m);
 }
@@ -474,10 +513,10 @@ pan_release(Monitor *m)
 	if (m->backdrop_offset_x != 0 || m->backdrop_offset_y != 0) {
 		/* A held, stationary drag may not have rendered for some time. */
 		m->backdrop_last = anim_now();
-		anim_schedule();
+		anim_schedule(m);
 	}
 	if ((uint32_t)(anim_now() - m->pan_last) > 50
-			|| hypot(m->pan_vx, m->pan_vy) < ANIM_GLIDE_MIN || !anim_start())
+			|| hypot(m->pan_vx, m->pan_vy) < ANIM_GLIDE_MIN || !anim_start(m))
 		return;
 	m->pan_glide = 1;
 	m->pan_last = anim_now();
@@ -501,7 +540,6 @@ pan_glide_tick(Monitor *m, uint32_t now)
 	m->pan_last = now;
 	if (hypot(m->pan_vx, m->pan_vy) < ANIM_GLIDE_MIN)
 		m->pan_glide = 0;
-	canvas_layout(m);
 	return m->pan_glide;
 }
 
@@ -606,7 +644,7 @@ snapshot_create(Client *c)
 			MAX(1, (int)round(c->rendered.height * pop))};
 	s->scale = c->visual_scale;
 	s->opacity = c->opacity;
-	s->start = anim_start();
+	s->start = anim_start(c->mon);
 	wl_list_insert(&snapshots, &s->link);
 	return s;
 }
@@ -673,7 +711,7 @@ anim_transfer_arrivals(Monitor *m)
 		if (anim_progress(ANIM_WORKSPACE, s->start, now) < 1.0 && anim_enabled()) {
 			double zoom = canvas_active(c) ? m->zoom : 1.0;
 			struct wlr_box base = c->rendered;
-			uint32_t start = anim_start();
+			uint32_t start = anim_start(m);
 			c->geom_from = client_displayed_geom(c, now);
 			c->geom_from.width = MAX(1, (int)round(s->frame.width / zoom));
 			c->geom_from.height = MAX(1, (int)round(s->frame.height / zoom));
@@ -738,47 +776,110 @@ snapshot_render(Snapshot *s, uint32_t now)
 	return 0;
 }
 
-/* Advance every animation by one frame; returns whether any is still running */
 static int
-anim_tick(void)
+anim_camera_tick(Monitor *m, uint32_t now)
+{
+	int active = 0, camera_changed = 0, backdrop_changed = 0;
+	double t;
+	if (m->backdrop_start) {
+		t = anim_progress(ANIM_ZOOM, m->backdrop_start, now);
+		m->backdrop_mix = m->backdrop_from + (m->backdrop_to - m->backdrop_from) * t;
+		if (t >= 1.0)
+			m->backdrop_start = 0;
+		active |= m->backdrop_start != 0;
+		backdrop_changed = 1;
+	}
+	if (m->zoom_start) {
+		t = anim_progress(ANIM_ZOOM, m->zoom_start, now);
+		if (t >= 1.0)
+			m->zoom_start = 0;
+		zoom_set(m, m->zoom_from + (m->zoom_to - m->zoom_from) * t);
+		active |= m->zoom_start != 0;
+		camera_changed = 1;
+	}
+	if (m->pan_glide) {
+		active |= pan_glide_tick(m, now);
+		camera_changed = 1;
+	}
+	m->camera_updated = camera_changed;
+	if (camera_changed)
+		canvas_layout(m); /* includes the wallpaper update */
+	else if (backdrop_changed || m->backdrop_offset_x != 0 || m->backdrop_offset_y != 0)
+		backdrop_update(m);
+	active |= (m->backdrop_offset_x != 0 || m->backdrop_offset_y != 0)
+			&& !m->pan_glide && !m->zoom_start
+			&& !(cursor_mode == CurCanvasPan && panmon == m);
+	return active;
+}
+
+/* A window may span outputs even though its canvas belongs to one monitor. */
+static int
+anim_monitor_on_output(Monitor *owner, Monitor *output)
+{
+	Client *c;
+	if (owner == output)
+		return 1;
+	wl_list_for_each(c, &clients, link)
+		if (c->mon == owner && client_is_rendered_on_mon(c, output))
+			return 1;
+	return 0;
+}
+
+static int
+snapshot_on_output(Snapshot *s, Monitor *m)
+{
+	if (s->mon == m)
+		return 1;
+	SnapshotPart *part;
+	wl_array_for_each(part, &s->parts) {
+		struct wlr_box box, intersection;
+		if (!wlr_scene_node_coords(part->node, &box.x, &box.y))
+			continue;
+		if (part->node->type == WLR_SCENE_NODE_RECT) {
+			struct wlr_scene_rect *rect = wlr_scene_rect_from_node(part->node);
+			box.width = rect->width;
+			box.height = rect->height;
+		} else {
+			struct wlr_scene_buffer *buffer = wlr_scene_buffer_from_node(part->node);
+			box.width = buffer->dst_width;
+			box.height = buffer->dst_height;
+		}
+		if (wlr_box_intersection(&intersection, &box, &m->m))
+			return 1;
+	}
+	return 0;
+}
+
+/* Advance only animations affecting this output. Absolute time preserves
+ * their duration across mixed refresh rates and cross-output windows. */
+static int
+anim_tick(Monitor *m)
 {
 	uint32_t now = anim_now();
+	Monitor *owner;
 	Snapshot *s, *tmp;
-	Monitor *m;
 	Client *c;
 	int active = 0;
-	double t;
-
-	wl_list_for_each(m, &mons, link) {
-		if (m->backdrop_start) {
-			t = anim_progress(ANIM_ZOOM, m->backdrop_start, now);
-			m->backdrop_mix = m->backdrop_from + (m->backdrop_to - m->backdrop_from) * t;
-			if (t >= 1.0)
-				m->backdrop_start = 0;
-			active |= m->backdrop_start != 0;
-			backdrop_update(m);
-		}
-		if (m->zoom_start) {
-			t = anim_progress(ANIM_ZOOM, m->zoom_start, now);
-			if (t >= 1.0)
-				m->zoom_start = 0;
-			zoom_apply(m, m->zoom_from + (m->zoom_to - m->zoom_from) * t);
-			active |= m->zoom_start != 0;
-		}
-		if (m->pan_glide)
-			active |= pan_glide_tick(m, now);
-		if (m->backdrop_offset_x != 0 || m->backdrop_offset_y != 0) {
-			active |= backdrop_motion(m, now);
-			backdrop_update(m);
-		}
+	wl_list_for_each(owner, &mons, link) {
+		owner->camera_updated = 0;
+		if (!owner->backdrop_start && !owner->zoom_start && !owner->pan_glide
+				&& owner->backdrop_offset_x == 0 && owner->backdrop_offset_y == 0)
+			continue;
+		if (anim_monitor_on_output(owner, m))
+			active |= anim_camera_tick(owner, now);
 	}
 	wl_list_for_each(c, &clients, link) {
-		if (!c->geom_start && !c->pop_start && !c->slide_start)
+		if (!c->mon || (!c->geom_start && !c->pop_start && !c->slide_start))
 			continue;
-		client_render(c);
+		if (c->mon != m && !client_is_rendered_on_mon(c, m))
+			continue;
+		if (!(c->mon->camera_updated && VISIBLEON(c, c->mon) && canvas_active(c)))
+			client_render(c);
 		active |= c->geom_start || c->pop_start || c->slide_start;
 	}
 	wl_list_for_each_safe(s, tmp, &snapshots, link) {
+		if (!snapshot_on_output(s, m))
+			continue;
 		if (snapshot_render(s, now))
 			snapshot_destroy(s);
 		else

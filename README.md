@@ -55,6 +55,10 @@ build/mono
 tools/monomsg/build/monomsg
 ```
 
+Use `make release` and `sudo make install-release` for stripped binaries with
+separate debug symbols. See [Performance](docs/performance.md) for details and
+measurements.
+
 Install starter configuration:
 
 ```sh

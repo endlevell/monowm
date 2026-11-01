@@ -1,3 +1,4 @@
+#define _XOPEN_SOURCE 700
 /* Here be a small dragon.
  * Not as large as the monster
  * in src/mono.c
@@ -45,7 +46,8 @@ static Config *g_loading_cfg = NULL;
 typedef struct {
 	int                  inotify_fd;
 	int                  dir_wd;  /* config's directory: saves, renames, recreation */
-	int                  file_wd; /* symlink target, or -1 if path is not a symlink */
+	int                  target_wd; /* symlink target directory, possibly dir_wd */
+	char                 target_name[NAME_MAX + 1];
 	char                 path[1024];
 	const char          *name;    /* basename within path */
 	config_reload_cb     cb;
@@ -133,10 +135,10 @@ lua_get_bool(lua_State *L, const char *key, bool def)
 static void
 parse_color_hex(uint32_t hex, float out[4])
 {
-	out[0] = ((hex >> 24) & 0xFF) / 255.0f;
-	out[1] = ((hex >> 16) & 0xFF) / 255.0f;
-	out[2] = ((hex >>  8) & 0xFF) / 255.0f;
 	out[3] = ( hex        & 0xFF) / 255.0f;
+	out[0] = ((hex >> 24) & 0xFF) / 255.0f * out[3];
+	out[1] = ((hex >> 16) & 0xFF) / 255.0f * out[3];
+	out[2] = ((hex >>  8) & 0xFF) / 255.0f * out[3];
 }
 
 /* Accepts 0xRRGGBBAA numbers and "#RRGGBB" / "#RRGGBBAA" strings */
@@ -399,120 +401,119 @@ parse_monitors(lua_State *L, Config *cfg)
 }
 
 static void
+command_finish(CfgCommand *command)
+{
+	if (command) {
+		free(command->args);
+		free(command);
+	}
+}
+
+void
+config_finish(Config *cfg)
+{
+	for (int i = 0; i < cfg->nkeybinds; i++)
+		command_finish(cfg->keybinds[i].command);
+	for (int i = 0; i < cfg->nbuttons; i++)
+		command_finish(cfg->buttons[i].command);
+	free(cfg->keybinds);
+	free(cfg->buttons);
+	memset(cfg, 0, sizeof(*cfg));
+}
+
+static CfgCommand *
+parse_command(lua_State *L)
+{
+	CfgCommand *command = calloc(1, sizeof(*command));
+	char args[CFG_MAX_ARGS][CFG_MAX_STRLEN] = {{0}};
+	if (!command)
+		return NULL;
+	lua_get_string(L, "action", command->action, sizeof(command->action));
+	lua_getfield(L, -1, "args");
+	if (lua_istable(L, -1)) {
+		int n = (int)lua_rawlen(L, -1);
+		for (int i = 1; i <= n && command->nargs < CFG_MAX_ARGS; i++) {
+			lua_rawgeti(L, -1, i);
+			if (lua_isstring(L, -1))
+				strncpy(args[command->nargs++], lua_tostring(L, -1), CFG_MAX_STRLEN - 1);
+			lua_pop(L, 1);
+		}
+	}
+	lua_pop(L, 1);
+	if (command->nargs) {
+		command->args = calloc(command->nargs, sizeof(*command->args));
+		if (!command->args) {
+			free(command);
+			return NULL;
+		}
+		memcpy(command->args, args, command->nargs * sizeof(*args));
+	}
+	return command;
+}
+
+static int
 parse_keybinds(lua_State *L, Config *cfg)
 {
 	lua_getglobal(L, "keybinds");
 	if (!lua_istable(L, -1)) {
 		lua_pop(L, 1);
-		return;
+		return 1;
 	}
-
-	struct xkb_context *xkb_ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-
 	int n = (int)lua_rawlen(L, -1);
 	for (int i = 1; i <= n && cfg->nkeybinds < CFG_MAX_KEYBINDS; i++) {
 		lua_rawgeti(L, -1, i);
 		if (!lua_istable(L, -1)) { lua_pop(L, 1); continue; }
-
-		CfgKeybind *kb = &cfg->keybinds[cfg->nkeybinds];
-		memset(kb, 0, sizeof(*kb));
-		kb->lua_ref = LUA_NOREF;
-
-		/* mods: array of strings */
-		if (!lua_get_mods(L, &kb->mods)) {
-			lua_pop(L, 1); /* keybind entry table */
-			continue;
-		}
-
-		/* key: string keysym name, e.g. "q", "Return", "XF86AudioMute" */
+		CfgKeybind kb = {.lua_ref = LUA_NOREF};
+		if (!lua_get_mods(L, &kb.mods)) { lua_pop(L, 1); continue; }
 		char keyname[CFG_MAX_STRLEN] = {0};
 		lua_get_string(L, "key", keyname, sizeof(keyname));
-		kb->key = xkb_keysym_from_name(keyname, XKB_KEYSYM_CASE_INSENSITIVE);
-		if (kb->key == XKB_KEY_NoSymbol) {
-			fprintf(stderr, "mono config: unknown key '%s', skipping bind\n",
-			        keyname);
-			lua_pop(L, 1); /* keybind entry table */
+		kb.key = xkb_keysym_from_name(keyname, XKB_KEYSYM_CASE_INSENSITIVE);
+		if (kb.key == XKB_KEY_NoSymbol) {
+			fprintf(stderr, "mono config: unknown key '%s', skipping bind\n", keyname);
+			lua_pop(L, 1);
 			continue;
 		}
-
-		lua_get_string(L, "action", kb->action, sizeof(kb->action));
-
-		/* args: optional array of strings */
-		kb->nargs = 0;
-		lua_getfield(L, -1, "args");
-		if (lua_istable(L, -1)) {
-			int na = (int)lua_rawlen(L, -1);
-			for (int a = 1; a <= na && kb->nargs < CFG_MAX_ARGS; a++) {
-				lua_rawgeti(L, -1, a);
-				if (lua_isstring(L, -1))
-					strncpy(kb->args[kb->nargs++],
-					        lua_tostring(L, -1),
-					        CFG_MAX_STRLEN - 1);
-				lua_pop(L, 1);
-			}
-		}
-		lua_pop(L, 1); /* args */
-
-		cfg->nkeybinds++;
-		lua_pop(L, 1); /* keybind entry */
+		if (!(kb.command = parse_command(L)))
+			return 0;
+		CfgKeybind *bindings = realloc(cfg->keybinds, (cfg->nkeybinds + 1) * sizeof(*bindings));
+		if (!bindings) { command_finish(kb.command); return 0; }
+		cfg->keybinds = bindings;
+		cfg->keybinds[cfg->nkeybinds++] = kb;
+		lua_pop(L, 1);
 	}
-
-	xkb_context_unref(xkb_ctx);
-	lua_pop(L, 1); /* keybinds table */
+	lua_pop(L, 1);
+	return 1;
 }
 
-static void
+static int
 parse_buttons(lua_State *L, Config *cfg)
 {
 	lua_getglobal(L, "buttons");
-	if (!lua_istable(L, -1)) {
-		lua_pop(L, 1);
-		return;
-	}
-
-	cfg->nbuttons = 0;
+	if (!lua_istable(L, -1)) { lua_pop(L, 1); return 1; }
 	int n = (int)lua_rawlen(L, -1);
 	for (int i = 1; i <= n && cfg->nbuttons < CFG_MAX_KEYBINDS; i++) {
 		lua_rawgeti(L, -1, i);
 		if (!lua_istable(L, -1)) { lua_pop(L, 1); continue; }
-
-		CfgButton *b = &cfg->buttons[cfg->nbuttons];
-		memset(b, 0, sizeof(*b));
-
-		if (!lua_get_mods(L, &b->mods)) {
-			lua_pop(L, 1); /* button entry table */
-			continue;
-		}
-
-		char btnname[CFG_MAX_STRLEN] = {0};
-		lua_get_string(L, "button", btnname, sizeof(btnname));
-		if      (!strcmp(btnname, "left"))   b->button = BTN_LEFT;
-		else if (!strcmp(btnname, "right"))  b->button = BTN_RIGHT;
-		else if (!strcmp(btnname, "middle")) b->button = BTN_MIDDLE;
-		else b->button = (uint32_t)atoi(btnname);
-
-		lua_get_string(L, "action", b->action, sizeof(b->action));
-
-		b->nargs = 0;
-		lua_getfield(L, -1, "args");
-		if (lua_istable(L, -1)) {
-			int na = (int)lua_rawlen(L, -1);
-			for (int a = 1; a <= na && b->nargs < CFG_MAX_ARGS; a++) {
-				lua_rawgeti(L, -1, a);
-				if (lua_isstring(L, -1))
-					strncpy(b->args[b->nargs++],
-					        lua_tostring(L, -1),
-					        CFG_MAX_STRLEN - 1);
-				lua_pop(L, 1);
-			}
-		}
-		lua_pop(L, 1); /* args */
-
-		cfg->nbuttons++;
+		CfgButton button = {0};
+		if (!lua_get_mods(L, &button.mods)) { lua_pop(L, 1); continue; }
+		char name[CFG_MAX_STRLEN] = {0};
+		lua_get_string(L, "button", name, sizeof(name));
+		if (!strcmp(name, "left")) button.button = BTN_LEFT;
+		else if (!strcmp(name, "right")) button.button = BTN_RIGHT;
+		else if (!strcmp(name, "middle")) button.button = BTN_MIDDLE;
+		else button.button = (uint32_t)atoi(name);
+		if (!(button.command = parse_command(L)))
+			return 0;
+		CfgButton *buttons = realloc(cfg->buttons, (cfg->nbuttons + 1) * sizeof(*buttons));
+		if (!buttons) { command_finish(button.command); return 0; }
+		cfg->buttons = buttons;
+		cfg->buttons[cfg->nbuttons++] = button;
 		lua_pop(L, 1);
 	}
 	lua_pop(L, 1);
+	return 1;
 }
+
 
 static void
 parse_autostart(lua_State *L, Config *cfg)
@@ -573,9 +574,8 @@ l_mono_bind(lua_State *L)
 			|| strstr(combo, "++"))
 		return luaL_error(L, "invalid binding combo '%s'", combo);
 
-	CfgKeybind *kb = &cfg->keybinds[cfg->nkeybinds];
-	memset(kb, 0, sizeof(*kb));
-	kb->lua_ref = LUA_NOREF;
+	CfgKeybind binding = {.lua_ref = LUA_NOREF};
+	CfgKeybind *kb = &binding;
 
 	/* combo is "logo+shift+a" style — split on '+', last token is the key */
 	char buf[CFG_MAX_STRLEN];
@@ -606,10 +606,14 @@ l_mono_bind(lua_State *L)
 		return 0;
 	}
 
+	CfgKeybind *bindings = realloc(cfg->keybinds, (cfg->nkeybinds + 1) * sizeof(*bindings));
+	if (!bindings)
+		return luaL_error(L, "out of memory allocating binding");
+	cfg->keybinds = bindings;
 	lua_pushvalue(L, 2); /* duplicate the function onto the stack top */
 	kb->lua_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 
-	cfg->nkeybinds++;
+	cfg->keybinds[cfg->nkeybinds++] = binding;
 	return 0;
 }
 
@@ -779,8 +783,10 @@ register_mono_api(lua_State *L)
 }
 
 int
-config_load(const char *path, Config *cfg)
+config_load(const char *path, Config *out)
 {
+	Config fresh = {0};
+	Config *cfg = &fresh;
 	lua_State *old_L = g_L;
 	lua_State *L;
 
@@ -799,10 +805,7 @@ config_load(const char *path, Config *cfg)
 	g_loading_cfg = cfg;
 	if (luaL_dofile(L, path) != LUA_OK) {
 		lua_log_error(L, "load");
-		g_loading_cfg = NULL;
-		lua_close(L);
-		g_L = old_L;
-		return -1;
+		goto failed;
 	}
 	g_loading_cfg = NULL;
 
@@ -829,12 +832,22 @@ config_load(const char *path, Config *cfg)
 	parse_input     (L, &cfg->input);
 	parse_rules     (L, cfg);
 	parse_monitors  (L, cfg);
-	parse_keybinds  (L, cfg);
-	parse_buttons   (L, cfg);
+	if (!parse_keybinds(L, cfg) || !parse_buttons(L, cfg)) {
+		fprintf(stderr, "mono config: out of memory parsing bindings\n");
+		goto failed;
+	}
 	parse_autostart (L, cfg);
 	if (old_L)
 		lua_close(old_L);
+	config_finish(out);
+	*out = fresh;
 	return 0;
+failed:
+	g_loading_cfg = NULL;
+	config_finish(cfg);
+	lua_close(L);
+	g_L = old_L;
+	return -1;
 }
 
 /* Apply functions */
@@ -859,8 +872,28 @@ config_apply_keybinds(const Config *cfg)
 
 /* Process groups of autostart runs (one per startup or reload that added
  * commands) */
-static pid_t autostart_groups[CFG_MAX_AUTOSTART];
-static int nautostart_groups;
+typedef struct AutostartGroup {
+	pid_t pid;
+	struct AutostartGroup *next;
+} AutostartGroup;
+static AutostartGroup *autostart_groups;
+
+static void
+autostart_prune(void)
+{
+	AutostartGroup **link = &autostart_groups;
+	while (*link) {
+		AutostartGroup *group = *link;
+		/* Retain a live sequencer until it has been reaped. */
+		if (kill(-group->pid, 0) < 0 && errno == ESRCH
+				&& getpgid(group->pid) < 0 && errno == ESRCH) {
+			*link = group->next;
+			free(group);
+		} else {
+			link = &group->next;
+		}
+	}
+}
 
 /* Autostarted programs belong to this session. Left running, they outlive
  * it, e.g. an audio server that keeps the next session from starting its
@@ -868,9 +901,12 @@ static int nautostart_groups;
 void
 config_autostart_stop(void)
 {
-	for (int i = 0; i < nautostart_groups; i++)
-		kill(-autostart_groups[i], SIGTERM);
-	nautostart_groups = 0;
+	while (autostart_groups) {
+		AutostartGroup *group = autostart_groups;
+		kill(-group->pid, SIGTERM);
+		autostart_groups = group->next;
+		free(group);
+	}
 }
 
 void
@@ -878,17 +914,39 @@ config_autostart_run(const CfgAutostart *cmds, int n)
 {
 	if (n == 0)
 		return;
+	autostart_prune();
+	AutostartGroup *group = malloc(sizeof(*group));
+	if (!group) {
+		perror("mono autostart: malloc");
+		return;
+	}
+	int ready[2];
+	if (pipe(ready) < 0) {
+		perror("mono autostart: pipe");
+		free(group);
+		return;
+	}
 
 	pid_t pid = fork();
 	if (pid < 0) {
 		perror("mono autostart: fork");
+		close(ready[0]);
+		close(ready[1]);
+		free(group);
 		return;
 	}
 	if (pid != 0) {
+		/* Returning only after setsid makes immediate shutdown reliable. */
+		char started;
+		close(ready[1]);
+		while (read(ready[0], &started, 1) < 0 && errno == EINTR)
+			;
+		close(ready[0]);
 		/* The sequencer's setsid() makes pid the process group of
 		 * everything it starts; remember it for config_autostart_stop() */
-		if (nautostart_groups < CFG_MAX_AUTOSTART)
-			autostart_groups[nautostart_groups++] = pid;
+		group->pid = pid;
+		group->next = autostart_groups;
+		autostart_groups = group;
 		return; /* compositor continues (sequencer runs in child) */
 	}
 
@@ -896,7 +954,15 @@ config_autostart_run(const CfgAutostart *cmds, int n)
 	 * a new session so the compositor's SIGCHLD handling doesn't
 	 * interfere with our waitpid calls. */
 	signal(SIGCHLD, SIG_DFL);
-	setsid();
+	signal(SIGINT, SIG_DFL);
+	signal(SIGTERM, SIG_DFL);
+	free(group);
+	close(ready[0]);
+	if (setsid() < 0)
+		_exit(1);
+	if (write(ready[1], "1", 1) != 1)
+		_exit(1);
+	close(ready[1]);
 	/* stdout may be the -s status pipe; keep command output out of it,
 	 * as spawn() does */
 	dup2(STDERR_FILENO, STDOUT_FILENO);
@@ -961,22 +1027,30 @@ path_is_link(const char *path)
 	return lstat(path, &st) == 0 && S_ISLNK(st.st_mode);
 }
 
-/*
- * Editing a symlinked config changes the link target, which the directory
- * watch cannot see, so the target is watched too. Called again whenever the
- * directory entry is replaced, since the link may now point elsewhere.
- */
+/* Watch the target's directory so atomic replacement doesn't orphan the
+ * watch on the previous inode. Keep the old directory while a target is
+ * temporarily missing, so recreating it can recover hot reload. */
 static void
 watch_target(WatchState *ws)
 {
 	int wd = -1;
-
-	if (path_is_link(ws->path))
-		wd = inotify_add_watch(ws->inotify_fd, ws->path, IN_CLOSE_WRITE);
-	/* The IN_IGNORED this queues never triggers a reload */
-	if (ws->file_wd >= 0 && ws->file_wd != wd)
-		inotify_rm_watch(ws->inotify_fd, ws->file_wd);
-	ws->file_wd = wd;
+	if (path_is_link(ws->path)) {
+		char *target = realpath(ws->path, NULL);
+		if (!target)
+			return;
+		char *slash = strrchr(target, '/');
+		strncpy(ws->target_name, slash + 1, sizeof(ws->target_name) - 1);
+		if (slash == target)
+			slash[1] = '\0';
+		else
+			*slash = '\0';
+		wd = inotify_add_watch(ws->inotify_fd, target,
+				IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE | IN_MASK_ADD);
+		free(target);
+	}
+	if (ws->target_wd >= 0 && ws->target_wd != wd && ws->target_wd != ws->dir_wd)
+		inotify_rm_watch(ws->inotify_fd, ws->target_wd);
+	ws->target_wd = wd;
 }
 
 static int
@@ -1003,23 +1077,22 @@ watch_dispatch(int fd, uint32_t mask, void *data)
 		const struct inotify_event *ev = (const struct inotify_event *)p;
 		p += sizeof(*ev) + ev->len;
 
-		if (ev->wd == ws->file_wd) {
-			if (ev->mask & IN_IGNORED)
-				ws->file_wd = -1;
-			else if (ev->mask & IN_CLOSE_WRITE)
-				changed = 1;
-		} else if (ev->wd == ws->dir_wd) {
-			if (ev->mask & IN_IGNORED) {
-				fprintf(stderr, "mono config: config directory removed, "
-				        "hot reload stopped\n");
+		if (ev->mask & IN_IGNORED) {
+			if (ev->wd == ws->target_wd)
+				ws->target_wd = -1;
+			if (ev->wd == ws->dir_wd) {
+				fprintf(stderr, "mono config: config directory removed, hot reload stopped\n");
 				ws->dir_wd = -1;
-			} else if (ev->len && !strcmp(ev->name, ws->name)) {
-				/* A new regular file is still empty; its
-				 * IN_CLOSE_WRITE follows */
-				if ((ev->mask & IN_CREATE) && !path_is_link(ws->path))
-					continue;
-				changed = replaced = 1;
 			}
+			continue;
+		}
+		int config_entry = ev->wd == ws->dir_wd && ev->len && !strcmp(ev->name, ws->name);
+		int target_entry = ev->wd == ws->target_wd && ev->len && !strcmp(ev->name, ws->target_name);
+		if (config_entry || target_entry) {
+			/* Wait for a new regular file to finish being written. */
+			if ((ev->mask & IN_CREATE) && !(config_entry && path_is_link(ws->path)))
+				continue;
+			changed = replaced = 1;
 		}
 	}
 
@@ -1041,6 +1114,7 @@ watch_dispatch(int fd, uint32_t mask, void *data)
 		        "Story of my life.\n");
 	}
 
+	config_finish(fresh);
 	free(fresh);
 	return 0;
 }
@@ -1060,7 +1134,7 @@ config_watch_start(struct wl_event_loop *loop, const char *path,
 	}
 
 	strncpy(ws->path, path, sizeof(ws->path) - 1);
-	ws->file_wd = -1;
+	ws->target_wd = -1;
 
 	char dir[sizeof(ws->path)];
 	const char *slash = strrchr(ws->path, '/');

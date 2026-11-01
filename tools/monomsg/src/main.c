@@ -32,6 +32,7 @@ static int cflag;
 static int vflag;
 static int mflag;
 static int fflag;
+static int requests_sent;
 
 static uint32_t occ, seltags, sel, urg;
 
@@ -89,8 +90,6 @@ static void
 dwl_ipc_output_active(void *data, struct zdwl_ipc_output_v2 *dwl_ipc_output,
 	uint32_t active)
 {
-	if (active && (!output_name || !*output_name))
-		output_name = strdup(data);
 	if (active) {
 		free(focused_output);
 		focused_output = data ? strdup(data) : NULL;
@@ -171,7 +170,10 @@ static void
 dwl_ipc_output_frame(void *data, struct zdwl_ipc_output_v2 *dwl_ipc_output)
 {
 	if (mode & SET) {
-		if (data && !(output_name && strcmp(output_name, (char *)data) == 0)) return;
+		if (requests_sent) return;
+		const char *target = output_name && *output_name ? output_name : focused_output;
+		if (data && (!target || strcmp(target, data) != 0)) return;
+		requests_sent = 1;
 		if (lflag) {
 			if (layout_idx == (size_t)-1) {
 				layout_idx = 0;
@@ -199,7 +201,7 @@ dwl_ipc_output_frame(void *data, struct zdwl_ipc_output_v2 *dwl_ipc_output)
 			for (; *t && *t >= '0' && *t <= '9'; t++)
 				i = *t-'0' + i*10;
 
-			if (toggle && !*t) {
+			if (!*t) {
 				if (i >= tagcount) die("bad tagset %s", tagset);
 				mask = 1u<<i;
 			}
@@ -253,8 +255,6 @@ dwl_ipc_output_frame(void *data, struct zdwl_ipc_output_v2 *dwl_ipc_output)
 
 			zdwl_ipc_output_v2_set_client_tags(dwl_ipc_output, and, xor);
 		}
-		wl_display_flush(display);
-		exit(0);
 	} else {
 		if (Fflag && mode == WATCH && focused_output)
 			printf("focusmon %s\n", focused_output);
@@ -459,8 +459,8 @@ main(int argc, char *argv[])
 		break;
 	case 'F':
 		Fflag = 1;
-		if (mode && mode != GET) usage(1);
-		mode = GET;
+		if (mode & SET) usage(1);
+		mode |= GET;
 		break;
 	case 'v':
 		vflag = 1;
@@ -516,6 +516,13 @@ main(int argc, char *argv[])
 		die("bad dwl-ipc protocol");
 
 	wl_display_roundtrip(display);
+
+	/* A flushed request may be dropped if the connection closes before the
+	 * server dispatches it. Wait for all changes queued by frame callbacks. */
+	if (mode & SET) {
+		if (!requests_sent) die("no matching output");
+		if (wl_display_roundtrip(display) < 0) die("failed to apply changes");
+	}
 
 	if (Fflag && !(mode == WATCH) && focused_output)
 		printf("focusmon %s\n", focused_output);

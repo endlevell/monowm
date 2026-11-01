@@ -34,6 +34,10 @@ Build output stays in two directories:
 - `build/mono`: compositor
 - `tools/monomsg/build/monomsg`: IPC command-line client
 
+For stripped release binaries with separate debug symbols, run `make release`.
+Install them with `sudo make install-release`. See [Performance](performance.md)
+for measurements, checks, and build details.
+
 Remove generated files and build output with:
 
 ```sh
